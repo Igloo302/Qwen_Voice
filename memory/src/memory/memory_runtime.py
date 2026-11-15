@@ -9,7 +9,6 @@ turns or transcript segments into typed Manager-facing memory units.
 from __future__ import annotations
 
 import logging
-import json
 import re
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -26,6 +25,7 @@ from .memory_manager import (
     _to_timestamp_text,
 )
 from llm_client import LLMClient
+from pwm_logging import CompactLogValue, as_pwm_logger
 from task_scheduler import TaskScheduler
 from .memory_context_manager import (
     FactExtractionTaskDecision,
@@ -58,11 +58,11 @@ class MemoryRuntime:
         memory_runtime_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
         embedding_config: Optional[Dict[str, Any]] = None,
-        logger: Optional[logging.Logger] = None,
-        memory_manager_logger: Optional[logging.Logger] = None,
+        logger: Optional[logging.Logger | logging.LoggerAdapter] = None,
+        memory_manager_logger: Optional[logging.Logger | logging.LoggerAdapter] = None,
     ) -> None:
         """Initialize input batching around already-composed shared resources."""
-        self._logger = logger or logging.getLogger(__name__)
+        self._logger = as_pwm_logger(logger or logging.getLogger(__name__))
         manager_config = dict(memory_manager_config or {})
         runtime_config = dict(memory_runtime_config or {})
         if Path(db_path).expanduser().resolve() != database.db_path.expanduser().resolve():
@@ -82,9 +82,7 @@ class MemoryRuntime:
         )
         self._memory_database = database
         self._memory_manager = manager
-        self._embedding_client = EmbeddingClient(
-            dict(resolved_embedding_config or getattr(manager, "_embedding_cfg", {}) or {}),
-        )
+        self._embedding_client = EmbeddingClient(resolved_embedding_config)
         if hasattr(self._memory_manager, "set_embedding_client"):
             self._memory_manager.set_embedding_client(self._embedding_client)
         memory_context_manager_config = build_memory_context_manager_config(
@@ -488,11 +486,11 @@ class MemoryRuntime:
             reason=reason,
             tags=tags,
         )
-        fact_followup_dispatch = self._task_scheduler.submit_flush_fact_followup_tasks()
+        signal_update_dispatch = self._task_scheduler.submit_flush_signal_update_tasks()
         submission_reports = [
             store_report,
             user_activity_report,
-            fact_followup_dispatch,
+            signal_update_dispatch,
         ]
         rejected_reasons = {
             "queue_rejected",
@@ -514,11 +512,11 @@ class MemoryRuntime:
                 bool(store_report.get("queued"))
                 or queued
                 or bool(user_activity_report.get("queued"))
-                or bool(fact_followup_dispatch.get("queued"))
+                or bool(signal_update_dispatch.get("queued"))
             ),
             "reason": str(store_report.get("reason") or ""),
             "user_activity": user_activity_report,
-            "fact_followup_dispatch": fact_followup_dispatch,
+            "signal_update_dispatch": signal_update_dispatch,
         }
 
     def _trigger_memory_fact_extraction_task_for_pending_units(
@@ -550,7 +548,7 @@ class MemoryRuntime:
                 for tag in unit.tags
                 if tag is not None and str(tag).strip()
             }
-            self._log_info(
+            self._logger.log_json_format(
                 "memory_runtime",
                 "memory_input_batch_detail",
                 {
@@ -609,50 +607,6 @@ class MemoryRuntime:
             if not queued:
                 self._memory_context_manager.restore_pending_units(pending_units)
 
-    def _log_info(self, scope: str, event: str, payload: Dict[str, Any]) -> None:
-        """Emit a structured JSON log record for runtime diagnostics."""
-        record = {
-            "scope": scope,
-            "event": event,
-            "payload": payload,
-        }
-        try:
-            body = json.dumps(
-                record,
-                ensure_ascii=False,
-                sort_keys=False,
-                indent=2,
-                default=str,
-            )
-            # Keep the record indented, but render each unit as one JSON object line.
-            for field in ("preceding_context_units", "units"):
-                items = payload.get(field)
-                if not isinstance(items, list) or not items:
-                    continue
-                expanded = json.dumps(
-                    items, ensure_ascii=False, indent=2, default=str,
-                ).replace("\n", "\n    ")
-                compact = "[\n" + ",\n".join(
-                    "      " + json.dumps(item, ensure_ascii=False, default=str)
-                    for item in items
-                ) + "\n    ]"
-                field_prefix = json.dumps(field) + ": "
-                body = body.replace(
-                    field_prefix + expanded, field_prefix + compact, 1,
-                )
-        except (TypeError, ValueError):
-            body = json.dumps(
-                {
-                    "scope": scope,
-                    "event": event,
-                    "payload": str(payload),
-                },
-                ensure_ascii=False,
-                sort_keys=False,
-                indent=2,
-            )
-        self._logger.info("\n%s", body)
-
     def trigger_memory_recall(
         self,
         query: str,
@@ -687,8 +641,8 @@ class MemoryRuntime:
             "accepted": bool(input_flush_report.get("accepted", True)),
             "input_flush": input_flush_report,
             "user_activity": dict(input_flush_report.get("user_activity") or {}),
-            "fact_followup_dispatch": dict(
-                input_flush_report.get("fact_followup_dispatch") or {}
+            "signal_update_dispatch": dict(
+                input_flush_report.get("signal_update_dispatch") or {}
             ),
         }
 
@@ -730,17 +684,17 @@ class MemoryRuntime:
         )
 
     @staticmethod
-    def _memory_units_log_view(units: Sequence[MemoryUnit]) -> List[Dict[str, Any]]:
+    def _memory_units_log_view(units: Sequence[MemoryUnit]) -> List[CompactLogValue]:
         """Return structured task-unit details without Runtime embeddings."""
         return [
-            {
+            CompactLogValue({
                 "unit_type": unit.unit_type,
                 "speakers": list(unit.speakers or []),
                 "texts": list(unit.texts or []),
                 "started_ats": list(unit.started_ats or []),
                 "ended_ats": list(unit.ended_ats or []),
                 "tags": list(unit.tags or []),
-            }
+            })
             for unit in units or []
             if _compact_whitespace(unit.text)
         ]

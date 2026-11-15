@@ -12,7 +12,9 @@ export const DOMAINS = {
   learning: '学习', social: '社交', interest: '兴趣', travel: '出行',
   information: '信息', finance: '财务',
 }
+export const INTENT_STATUS_KEYS = ['pending', 'in_progress', 'blocked', 'completed', 'cancelled']
 export const STATUSES = {
+  pending: '待处理',
   active: '有效', planned: '已计划', rescheduled: '已改期', open: '待处理',
   in_progress: '进行中', blocked: '受阻', completed: '已完成', cancelled: '已取消',
   occurred: '已发生', weakened: '依据减弱', expired: '已失效',

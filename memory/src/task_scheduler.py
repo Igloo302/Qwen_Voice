@@ -1,4 +1,4 @@
-"""FIFO execution and operation reporting for asynchronous memory tasks."""
+"""Priority execution and operation reporting; FIFO within each priority."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ import queue
 import sqlite3
 import threading
 import time
+from concurrent.futures import Future
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 from task_execution_database import TaskExecutionDB
 
 if TYPE_CHECKING:
-    from .memory_database import UserMemoryDB
+    from memory.memory_database import UserMemoryDB
 
 
 TaskHandler = Callable[..., Any]
@@ -239,17 +240,21 @@ class TaskOperationReporter:
                 not in failure_statuses
             )
         if operation_type in {
-            "memory_flush_fact_followups",
+            "memory_flush_signal_updates",
             "memory_user_activity_extraction",
             "memory_user_thread_update",
             "memory_user_claim_update",
             "memory_user_observed_pattern_update",
             "memory_user_intent_update",
+            "memory_user_intent_update_from_activities",
             "user_state_update_from_user_claims",
             "user_state_update_from_user_threads",
             "user_state_update_from_user_observed_patterns",
             "user_prediction_update_from_intent_events",
+            "user_prediction_reassessment",
+            "user_prediction_window_expiration",
             "user_proactive_policy_evaluation",
+            "proactive_service_feedback",
         }:
             if not isinstance(result, dict):
                 return False
@@ -294,17 +299,17 @@ class TaskOperationReporter:
 
 
 class TaskScheduler:
-    """Own the complete lifecycle of queued tasks on one FIFO worker."""
+    """Own queued tasks on one worker, with FIFO within each priority."""
 
-    _FACT_FOLLOWUP_TASK_KINDS = (
+    _SIGNAL_UPDATE_TASK_KINDS = (
         "memory_user_claim_update",
         "memory_user_observed_pattern_update",
         "memory_user_intent_update",
     )
     _SIGNAL_TASK_TARGETS = {
-        "memory_user_claim_update": "explicit_user_claim",
-        "memory_user_observed_pattern_update": "user_action_signal_consolidation",
-        "memory_user_intent_update": "user_intent_update",
+        "memory_user_claim_update": "user_claim_signal",
+        "memory_user_observed_pattern_update": "user_action_signal",
+        "memory_user_intent_update": "user_intent_signal",
     }
 
     def __init__(
@@ -315,14 +320,15 @@ class TaskScheduler:
         logger: Optional[logging.Logger] = None,
         worker_name: str = "memory-task-worker",
         task_scheduling_config: Optional[Dict[str, Any]] = None,
-        claim_state_database: Optional[UserMemoryDB] = None,
+        user_memory_db: Optional[UserMemoryDB] = None,
         memory_enabled: Any = True,
     ) -> None:
         self._operation_reporter = operation_reporter
         self._handlers: Dict[str, TaskHandler] = {}
-        self._queue: queue.Queue[Dict[str, Any]] = queue.Queue(
+        self._queue: queue.PriorityQueue = queue.PriorityQueue(
             maxsize=max(1, int(maxsize)),
         )
+        self._submission_sequence = 0
         self._logger = logger or logging.getLogger(__name__)
         self._worker_name = worker_name
         self._worker_thread: Optional[threading.Thread] = None
@@ -335,6 +341,13 @@ class TaskScheduler:
             else {}
         )
         self._memory_enabled = self._config_bool(memory_enabled, True)
+        self._signal_lookback_hours = {
+            "user_claim_signal": float(settings.get("user_claim_signal_lookback_hours", 6)),
+            "user_intent_signal": float(settings.get("user_intent_signal_lookback_hours", 6)),
+        }
+        for target, hours in self._signal_lookback_hours.items():
+            if not 0 < hours < float("inf"):
+                raise ValueError(f"Signal lookback hours must be finite and positive: {target}")
         user_state_updates_enabled = self._config_bool(
             settings.get("enable_memory_user_state_update"), True,
         )
@@ -351,14 +364,27 @@ class TaskScheduler:
             "memory_user_intent_update": self._config_bool(
                 settings.get("enable_memory_user_intent_update"), True,
             ),
+            "memory_user_intent_update_from_activities": self._config_bool(
+                settings.get("enable_memory_user_intent_update_from_activities"),
+                self._config_bool(settings.get("enable_memory_user_intent_update"), True),
+            ),
             "user_state_update_from_user_claims": user_state_updates_enabled,
             "user_state_update_from_user_threads": user_state_updates_enabled,
             "user_state_update_from_user_observed_patterns": user_state_updates_enabled,
             "user_prediction_update_from_intent_events": self._config_bool(
                 settings.get("enable_user_prediction"), True,
             ),
+            "user_prediction_reassessment": self._config_bool(
+                settings.get("enable_user_prediction"), True,
+            ),
+            "user_prediction_window_expiration": self._config_bool(
+                settings.get("enable_user_prediction"), True,
+            ),
             "user_proactive_policy_evaluation": self._config_bool(
                 settings.get("enable_user_proactive_policy_evaluation"), True,
+            ),
+            "proactive_service_feedback": self._config_bool(
+                settings.get("enable_proactive_service_feedback"), True,
             ),
         }
         self._user_prediction_horizon_hours = max(
@@ -366,14 +392,26 @@ class TaskScheduler:
         )
         self._prediction_lock = threading.RLock()
         self._prediction_events_inflight: set[int] = set()
-        self._claim_state_database = claim_state_database
+        self._prediction_reassessment_pending = False
+        self._prediction_window_expiration_pending = False
+        self._prediction_reassessment_retry_at = 0.0
+        self._prediction_reassessment_retry_seconds = max(
+            1.0, float(settings.get("user_prediction_reassessment_retry_seconds", 300)),
+        )
+        self._user_memory_db = user_memory_db
         self._task_execution_db: Optional[TaskExecutionDB] = None
-        if claim_state_database is not None and hasattr(claim_state_database, "db_path"):
-            task_db_path = claim_state_database.db_path.with_name("task_scheduler.db")
+        if user_memory_db is not None and hasattr(user_memory_db, "db_path"):
+            task_db_path = user_memory_db.db_path.with_name("task_scheduler.db")
             self._task_execution_db = TaskExecutionDB(task_db_path)
             try:
-                signal_references = claim_state_database.get_user_signal_batches()
-                self._task_execution_db.register_signals(**signal_references)
+                signal_references = user_memory_db.get_user_signal_batches()
+                recovered = self._task_execution_db.register_signals(**signal_references)
+                if recovered:
+                    self._logger.warning(
+                        "Recovered unregistered signals without producer input time count=%s; "
+                        "undated claim/intent batches are excluded from time-window scheduling",
+                        recovered,
+                    )
             except Exception:
                 self._task_execution_db.close()
                 raise
@@ -383,51 +421,10 @@ class TaskScheduler:
         self._claim_state_lock = threading.Lock()
         self._claim_state_task_pending = False
         self._claim_state_force_requested = False
-        self._fact_followup_thresholds = {
-            "memory_user_claim_update": {
-                "default": {
-                    "batches": max(1, int(settings.get("user_claim_min_signal_batches", 4) or 4)),
-                    "facts": max(1, int(settings.get("user_claim_min_signal_facts", 8) or 8)),
-                },
-                "interaction": {
-                    "batches": max(1, int(settings.get("interaction_user_claim_min_signal_batches", 3) or 3)),
-                    "facts": max(1, int(settings.get("interaction_user_claim_min_signal_facts", 5) or 5)),
-                },
-            },
-            "memory_user_intent_update": {
-                "default": {
-                    "batches": max(1, int(settings.get("user_intent_min_signal_batches", 4) or 4)),
-                    "facts": max(1, int(settings.get("user_intent_min_signal_facts", 5) or 5)),
-                },
-                "interaction": {
-                    "batches": max(1, int(settings.get("interaction_user_intent_min_signal_batches", 3) or 3)),
-                    "facts": max(1, int(settings.get("interaction_user_intent_min_signal_facts", 3) or 3)),
-                },
-            },
-            "memory_user_observed_pattern_update": {
-                "default": {
-                    "batches": max(1, int(settings.get("user_action_min_signal_batches", 4) or 4)),
-                    "facts": max(1, int(settings.get("user_action_min_signal_facts", 8) or 8)),
-                },
-                "interaction": {
-                    "batches": max(1, int(settings.get("interaction_user_action_min_signal_batches", 3) or 3)),
-                    "facts": max(1, int(settings.get("interaction_user_action_min_signal_facts", 5) or 5)),
-                },
-            },
-        }
-        self._fact_followup_state = {
-            task_kind: {
-                "generation": 0,
-                "unscheduled_signal_batches": 0,
-                "unscheduled_signal_facts": 0,
-                "unscheduled_contains_interaction": False,
-            }
-            for task_kind in self._FACT_FOLLOWUP_TASK_KINDS
-        }
         self._latest_input_time_end = ""
         self.register_handler(
-            "memory_flush_fact_followups",
-            self._process_flush_fact_followup_tasks,
+            "memory_flush_signal_updates",
+            self._process_flush_signal_update_tasks,
         )
 
     @property
@@ -440,17 +437,33 @@ class TaskScheduler:
         """Reporter shared with synchronous operations such as recall."""
         return self._operation_reporter
 
-    def _select_pending_signal_ids(self, target: str) -> List[int]:
-        if self._task_execution_db is None or self._claim_state_database is None:
+    def _select_pending_signal_ids(
+        self, target: str, *, reference_timestamp: Any = None,
+    ) -> List[int]:
+        if self._task_execution_db is None or self._user_memory_db is None:
             return []
         signal_type = {
-            "user_intent_update": "intent",
-            "user_action_signal_consolidation": "action",
+            "user_intent_signal": "intent",
+            "user_action_signal": "action",
         }.get(target, "claim")
-        pending_ids = self._task_execution_db.pending_signal_ids(target)
+        all_pending_ids = self._task_execution_db.pending_signal_ids(target)
+        pending_ids = all_pending_ids
+        if target in self._signal_lookback_hours:
+            reference = (reference_timestamp or self._latest_input_time_end
+                         or datetime.now().astimezone().isoformat())
+            pending_ids = self._task_execution_db.pending_signal_ids(
+                target, reference_timestamp=reference,
+                lookback_hours=self._signal_lookback_hours[target],
+            )
+            self._logger.info(
+                "signal selection target=%s reference_timestamp=%s lookback_hours=%s "
+                "pending_count=%s within_window_count=%s excluded_by_time_count=%s",
+                target, reference, self._signal_lookback_hours[target],
+                len(all_pending_ids), len(pending_ids), len(all_pending_ids) - len(pending_ids),
+            )
         if not pending_ids:
             return []
-        with self._claim_state_database.reader_transaction() as reader_db:
+        with self._user_memory_db.reader_transaction() as reader_db:
             pending_signals = reader_db.get_user_signals_by_ids(
                 signal_type, pending_ids,
             )
@@ -465,20 +478,27 @@ class TaskScheduler:
     ) -> Dict[str, Any]:
         """Freeze pending signal IDs; task handlers enforce their own limits."""
         prepared = dict(payload)
+        if task_kind in {"memory_user_claim_update", "memory_user_intent_update"}:
+            prepared["reference_timestamp"] = (
+                prepared.get("reference_timestamp") or self._latest_input_time_end
+                or datetime.now().astimezone().isoformat()
+            )
         if task_kind == "memory_user_claim_update":
             if "signal_ids" not in prepared:
                 prepared["signal_ids"] = self._select_pending_signal_ids(
-                    "explicit_user_claim",
+                    "user_claim_signal",
+                    reference_timestamp=prepared["reference_timestamp"],
                 )
         elif task_kind == "memory_user_intent_update":
             if "signal_ids" not in prepared:
                 prepared["signal_ids"] = self._select_pending_signal_ids(
-                    "user_intent_update",
+                    "user_intent_signal",
+                    reference_timestamp=prepared["reference_timestamp"],
                 )
         elif task_kind == "memory_user_observed_pattern_update":
             if "signal_ids" not in prepared:
                 prepared["signal_ids"] = self._select_pending_signal_ids(
-                    "user_action_signal_consolidation",
+                    "user_action_signal",
                 )
         return prepared
 
@@ -550,8 +570,19 @@ class TaskScheduler:
         *,
         completion_context: Optional[Dict[str, Any]] = None,
         report_payload: Optional[Dict[str, Any]] = None,
+        priority: Optional[int] = None,
+        result_future: Optional[Future] = None,
     ) -> Dict[str, Any]:
-        """Enqueue and report a task, or return a recorded rejection."""
+        """Enqueue a non-preemptive task; lower priority numbers run first.
+
+        Proactive service defaults to 0 (highest), other tasks to 10. Tasks
+        with equal priority execute in submission order.
+        """
+        resolved_priority = priority
+        if resolved_priority is None:
+            resolved_priority = 0 if task_kind == "user_proactive_policy_evaluation" else 10
+        if type(resolved_priority) is not int or resolved_priority < 0:
+            raise ValueError("priority must be a nonnegative integer")
         # Enqueueing must not wait for the worker's long-running LLM handler.
         # The worker still holds _execution_lock for its shared writer connection;
         # signal validation above uses its own read-only connection.
@@ -577,9 +608,15 @@ class TaskScheduler:
                 "task_id": task_id,
                 "started_at": time.monotonic(),
                 "completion_context": task_completion_context,
+                "priority": resolved_priority,
+                "result_future": result_future,
             }
             if self._queue.full():
                 return self._reject_locked(task_kind, task_id, "worker_queue_full")
+            if task_kind == "user_prediction_reassessment" and self._prediction_reassessment_pending:
+                return self._reject_locked(task_kind, task_id, "reassessment_already_pending")
+            if task_kind == "user_prediction_window_expiration" and self._prediction_window_expiration_pending:
+                return self._reject_locked(task_kind, task_id, "window_expiration_already_pending")
             if task_kind == "memory_user_thread_update":
                 if self._task_execution_db is None:
                     return self._reject_locked(task_kind, task_id, "task_execution_database_unavailable")
@@ -635,10 +672,15 @@ class TaskScheduler:
                     )
             # Publish only after the reporter and task DB know the task. The
             # worker may take it immediately after put_nowait returns.
-            self._queue.put_nowait(task)
+            if task_kind == "user_prediction_reassessment":
+                self._prediction_reassessment_pending = True
+            if task_kind == "user_prediction_window_expiration":
+                self._prediction_window_expiration_pending = True
+            self._submission_sequence += 1
+            self._queue.put_nowait((resolved_priority, self._submission_sequence, task))
             self._logger.info(
-                "scheduled task queued task_kind=%s task_id=%s queue_depth=%s",
-                task_kind, task_id, self._queue.qsize(),
+                "scheduled task queued task_kind=%s task_id=%s priority=%s queue_depth=%s",
+                task_kind, task_id, resolved_priority, self._queue.qsize(),
             )
             self._ensure_worker_locked()
         return {
@@ -647,6 +689,22 @@ class TaskScheduler:
             "task_id": task_id,
             "operation_type": task_kind,
         }
+
+    def submit_and_wait(
+        self, task_kind: str, payload: Dict[str, Any], *, timeout: Optional[float] = None,
+    ) -> Any:
+        """Wait for this task's result, without holding the worker execution lock.
+
+        A timeout stops waiting, not execution. A handler must not wait on its
+        own worker; background tasks should use submit instead.
+        """
+        if threading.current_thread() is self._worker_thread:
+            raise RuntimeError("Cannot wait for a queued task from its worker")
+        future = Future()
+        report = self.submit(task_kind, payload, result_future=future)
+        if not report.get("queued"):
+            raise RuntimeError(f"Task not queued: {report.get('reason')}")
+        return future.result(timeout=timeout)
 
     def reject(self, task_kind: str, reason: str) -> Dict[str, Any]:
         """Record a domain-level rejection before a task enters the queue."""
@@ -743,17 +801,20 @@ class TaskScheduler:
     def _worker_loop(self) -> None:
         while not self._shutdown_event.is_set() or not self._queue.empty():
             try:
-                task = self._queue.get(timeout=0.2)
+                _, _, task = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
             try:
                 self._execute_scheduled_task(task)
-            except Exception:
+            except Exception as exc:
                 self._logger.exception(
                     "Scheduled task handler failed task_kind=%s task_id=%s",
                     task.get("kind"),
                     task.get("task_id"),
                 )
+                future = task.get("result_future")
+                if future is not None and not future.done():
+                    future.set_exception(exc)
             finally:
                 self._queue.task_done()
 
@@ -765,8 +826,8 @@ class TaskScheduler:
         error: Optional[BaseException] = None
         handler_started_at = time.monotonic()
         self._logger.info(
-            "scheduled task started task_kind=%s task_id=%s queue_wait_ms=%.1f",
-            task_kind, task_id,
+            "scheduled task started task_kind=%s task_id=%s priority=%s queue_wait_ms=%.1f",
+            task_kind, task_id, task.get("priority"),
             (handler_started_at - float(task["started_at"])) * 1000,
         )
         try:
@@ -843,6 +904,58 @@ class TaskScheduler:
             "scheduled task follow-up finished task_kind=%s task_id=%s queue_depth=%s",
             task_kind, task_id, self._queue.qsize(),
         )
+        future = task.get("result_future")
+        if future is not None and not future.done():
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(result)
+
+    def trigger_user_prediction_time_tick(
+        self, *, reference_timestamp: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Queue window cleanup first, then independently consider due-defer work.
+
+        Each subreport describes one task; queued means at least one was queued.
+        Defer retry cooldown must never suppress deterministic expiration.
+        """
+        reference = datetime.now().astimezone()
+        if reference_timestamp is not None:
+            reference = (reference_timestamp if isinstance(reference_timestamp, datetime)
+                         else datetime.fromisoformat(str(reference_timestamp).replace("Z", "+00:00")))
+            if reference.tzinfo is None:
+                reference = reference.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        with self._prediction_lock:
+            timestamp = reference.isoformat() if reference_timestamp is not None else None
+            if self._prediction_window_expiration_pending:
+                expiration_report = {
+                    "queued": False, "status": "skipped", "reason": "window_expiration_already_pending",
+                }
+            else:
+                expiration_report = self.submit(
+                    "user_prediction_window_expiration", {"reference_timestamp": timestamp},
+                )
+            if self._prediction_reassessment_pending:
+                reassessment_report = {
+                    "queued": False, "status": "skipped", "reason": "reassessment_already_pending",
+                }
+            elif reference.timestamp() < self._prediction_reassessment_retry_at:
+                reassessment_report = {
+                    "queued": False, "status": "skipped", "reason": "reassessment_retry_cooldown",
+                }
+            else:
+                # Resolve real time at execution; preserve an explicit replay clock.
+                reassessment_report = self.submit("user_prediction_reassessment", {
+                    "reference_timestamp": timestamp,
+                    "horizon_hours": self._user_prediction_horizon_hours,
+                })
+        queued = bool(expiration_report.get("queued") or reassessment_report.get("queued"))
+        report = {
+            "queued": queued, "status": "queued" if queued else "skipped",
+            "window_expiration_task": expiration_report, "reassessment_task": reassessment_report,
+        }
+        self._logger.info("prediction time tick reference_timestamp=%s report=%s", reference.isoformat(), report)
+        return report
 
     def trigger_user_state_update(self, *, drain: bool = False) -> Dict[str, Any]:
         """Inspect persisted claims now and enqueue only the actual state update.
@@ -932,37 +1045,37 @@ class TaskScheduler:
         """Explicitly process successive batches; never start a periodic clock."""
         return self.trigger_user_state_update(drain=True)
 
-    def submit_flush_fact_followup_tasks(self) -> Dict[str, Any]:
-        """Queue a FIFO boundary; resolve pending signals only when it executes."""
-        return self.submit("memory_flush_fact_followups", {})
+    def submit_flush_signal_update_tasks(self) -> Dict[str, Any]:
+        """Queue a normal-priority boundary; resolve signals when it executes."""
+        return self.submit("memory_flush_signal_updates", {})
 
-    def _process_flush_fact_followup_tasks(self) -> Dict[str, Any]:
-        """Submit unreserved signals produced by preceding fact tasks."""
-        followup_reports = self._submit_final_fact_followup_tasks()
+    def _process_flush_signal_update_tasks(self) -> Dict[str, Any]:
+        """Drain unreserved signals after preceding fact and activity tasks."""
+        signal_reports = self._submit_final_signal_update_tasks()
         failed_task_kinds = [
             task_kind
-            for task_kind, report in followup_reports.items()
+            for task_kind, report in signal_reports.items()
             if not report.get("queued")
             and report.get("reason") not in {"no_pending_signals", "task_disabled"}
         ]
         self._logger.info(
-            "final memory follow-ups submitted claim_queued=%s "
+            "final signal updates submitted claim_queued=%s "
             "observed_pattern_queued=%s intent_queued=%s",
-            bool(followup_reports["memory_user_claim_update"].get("queued")),
-            bool(followup_reports["memory_user_observed_pattern_update"].get("queued")),
-            bool(followup_reports["memory_user_intent_update"].get("queued")),
+            bool(signal_reports["memory_user_claim_update"].get("queued")),
+            bool(signal_reports["memory_user_observed_pattern_update"].get("queued")),
+            bool(signal_reports["memory_user_intent_update"].get("queued")),
         )
         return {
             "status": "failed" if failed_task_kinds else "ok",
-            "fact_followup_tasks": followup_reports,
+            "signal_update_tasks": signal_reports,
             "failed_task_kinds": failed_task_kinds,
         }
 
-    def _submit_final_fact_followup_tasks(self) -> Dict[str, Dict[str, Any]]:
+    def _submit_final_signal_update_tasks(self) -> Dict[str, Dict[str, Any]]:
         with self._worker_lock:
             resolved_timestamp = self._latest_input_time_end
         reports: Dict[str, Dict[str, Any]] = {}
-        for task_kind in self._FACT_FOLLOWUP_TASK_KINDS:
+        for task_kind in self._SIGNAL_UPDATE_TASK_KINDS:
             payload: Dict[str, Any] = {
                 "reference_timestamp": resolved_timestamp or None,
             }
@@ -977,15 +1090,18 @@ class TaskScheduler:
         task_kind = str(event.get("task_kind") or "")
         postprocessors = {
             "memory_fact_extraction": self._postprocess_fact_extraction_task,
+            "proactive_service_feedback": self._postprocess_fact_extraction_task,
             "memory_user_activity_extraction": self._postprocess_user_activity_task,
             "memory_user_thread_update": self._postprocess_user_thread_update_task,
             "memory_user_claim_update": self._postprocess_user_claim_update_task,
-            "memory_user_observed_pattern_update": self._postprocess_fact_followup_task,
-            "memory_user_intent_update": self._postprocess_fact_followup_task,
+            "memory_user_observed_pattern_update": self._postprocess_signal_update_task,
+            "memory_user_intent_update": self._postprocess_signal_update_task,
             "user_state_update_from_user_claims": (
                 self._postprocess_user_state_update_from_user_claims_task
             ),
             "user_prediction_update_from_intent_events": self._postprocess_user_prediction_task,
+            "user_prediction_reassessment": self._postprocess_prediction_reassessment_task,
+            "user_prediction_window_expiration": self._postprocess_prediction_window_expiration_task,
         }
         completion: Dict[str, Any] = {"postprocessed": False}
         postprocess = postprocessors.get(task_kind)
@@ -999,17 +1115,16 @@ class TaskScheduler:
     ) -> None:
         task_kind = str(event.get("task_kind") or "")
         schedulers = {
-            "memory_fact_extraction": self._schedule_after_fact_extraction_task,
             "memory_user_activity_extraction": self._schedule_after_user_activity_task,
             "memory_user_thread_update": self._schedule_after_user_thread_update_task,
             "memory_user_observed_pattern_update": (
                 self._schedule_after_user_observed_pattern_update_task
             ),
             "memory_user_intent_update": self._schedule_after_user_intent_update_task,
+            "memory_user_intent_update_from_activities": self._schedule_after_user_intent_update_task,
             "user_state_update_from_user_claims": (
                 self._schedule_after_user_state_update_from_user_claims_task
             ),
-            "user_prediction_update_from_intent_events": self._schedule_after_user_prediction_task,
         }
         schedule = schedulers.get(task_kind)
         if schedule is None:
@@ -1021,27 +1136,28 @@ class TaskScheduler:
         self, event: Dict[str, Any],
     ) -> None:
         result = event.get("result")
+        context = dict(event.get("completion_context") or {})
+        if event.get("task_kind") == "proactive_service_feedback" and isinstance(result, dict):
+            context.update(
+                input_time_end=result.get("reference_timestamp"),
+                contains_interaction_turn=result.get("contains_interaction_turn", False),
+            )
         if (isinstance(result, dict) and self._task_execution_db is not None
-                and self._claim_state_database is not None):
-            signal_references = self._claim_state_database.get_user_signal_batches(
-                result.get("fact_ids") or [],
+                and self._user_memory_db is not None):
+            signal_references = self._user_memory_db.get_user_signal_batches(
+                source_type="fact", source_ids=result.get("fact_ids") or [],
             )
             self._task_execution_db.register_signals(
                 **signal_references,
                 source_task_id=str(event.get("task_id") or ""),
+                source_time_end=context.get("input_time_end") or "",
             )
         if event.get("succeeded") and isinstance(result, dict):
+            if event.get("task_kind") == "proactive_service_feedback":
+                self._record_input_time_end(result.get("reference_timestamp"))
             self._record_fact_extraction_task_result(
-                result, completion_context=event.get("completion_context"),
+                result, completion_context=context,
             )
-
-    def _schedule_after_fact_extraction_task(
-        self, event: Dict[str, Any], completion: Dict[str, Any],
-    ) -> None:
-        if (completion["postprocessed"] and event.get("succeeded")
-                and isinstance(event.get("result"), dict)):
-            for task_kind in self._FACT_FOLLOWUP_TASK_KINDS:
-                self._schedule_fact_followup_if_eligible(task_kind)
 
     def _postprocess_user_activity_task(self, event: Dict[str, Any]) -> None:
         result = event.get("result")
@@ -1049,6 +1165,17 @@ class TaskScheduler:
             self._task_execution_db.register_user_thread_activities(
                 result.get("user_activity_item_ids") or [],
             )
+            signal_ids = result.get("user_action_signal_ids") or []
+            if signal_ids:
+                added = self._task_execution_db.register_signals(
+                    claim_signal_ids=[], intent_signal_ids=[], action_signal_ids=signal_ids,
+                    source_task_id=str(event.get("task_id") or ""),
+                    source_time_end=result.get("reference_timestamp") or "",
+                )
+                self._logger.info(
+                    "activity action signals registered task_id=%s signal_ids=%s added=%s",
+                    event.get("task_id"), signal_ids, added,
+                )
 
     def _postprocess_user_thread_update_task(self, event: Dict[str, Any]) -> None:
         if self._task_execution_db is None:
@@ -1067,9 +1194,22 @@ class TaskScheduler:
         result = event.get("result")
         if not event.get("succeeded") or not isinstance(result, dict):
             return
+        # Use the processed source window, even when no activity was extracted.
+        # Do not mix in pending signals from unrelated or later windows.
+        self._schedule_signal_updates_for_activity_window(result)
         activity_ids = result.get("user_activity_item_ids") or []
         if not activity_ids:
             return
+        # New activities are the sole automatic entry. Do not scan historical
+        # activities from the intent-update completion path.
+        lifecycle_kind = "memory_user_intent_update_from_activities"
+        if self._task_enabled[lifecycle_kind] and lifecycle_kind in self._handlers:
+            report = self.submit(lifecycle_kind, {
+                "activity_ids": list(activity_ids),
+                "reference_timestamp": result.get("reference_timestamp") or self._latest_input_time_end or None,
+            })
+            if not report.get("queued"):
+                self._logger.warning("Activity intent lifecycle update not queued: %s", report)
         if self._task_enabled["memory_user_thread_update"]:
             report = self.submit("memory_user_thread_update", {})
             if not report.get("queued"):
@@ -1108,54 +1248,36 @@ class TaskScheduler:
         with self._prediction_lock:
             self._prediction_events_inflight.difference_update(event_ids)
             if (event.get("succeeded") and isinstance(result, dict)
-                    and result.get("status") in {"ok", "empty"}
+                    and result.get("status") in {"ok", "empty", "partial"}
                     and self._task_execution_db is not None):
                 self._task_execution_db.complete_prediction_intent_events(
                     sorted(set(result.get("processed_intent_event_ids") or []) & set(event_ids)),
                 )
 
-    def _schedule_after_user_prediction_task(
-        self, event: Dict[str, Any], completion: Dict[str, Any],
-    ) -> None:
-        result = event.get("result")
-        if not event.get("succeeded") or not isinstance(result, dict):
-            return
-        new_prediction_ids = sorted({
-            int(item["id"])
-            for item in result.get("predictions") or []
-            if isinstance(item, dict)
-            and item.get("save_action") == "created"
-            and str(item.get("id") or "").isdigit()
-            and int(item["id"]) > 0
-        })
-        invalidated_prediction_ids = [
-            int(value) for value in result.get("invalidated_prediction_ids") or []
-            if str(value).isdigit() and int(value) > 0
-        ]
-        # Closing services for invalidated sources is cleanup, not a fresh LLM evaluation.
-        prediction_ids = sorted(set(new_prediction_ids + invalidated_prediction_ids))
-        if not prediction_ids:
-            return
-        reference_timestamp = (result.get("prediction_context") or {}).get("as_of")
-        report = self.submit(
-            "user_proactive_policy_evaluation",
-            {
-                "prediction_ids": prediction_ids,
-                "source_prediction_task_id": str(event.get("task_id") or ""),
-                "runtime_context": {},
-                "reference_timestamp": reference_timestamp,
-            },
-            report_payload={
-                "prediction_ids": prediction_ids,
-                "source_prediction_task_id": str(event.get("task_id") or ""),
-                "reference_timestamp": reference_timestamp,
-            },
-        )
-        if not report.get("queued"):
-            self._logger.warning(
-                "proactive policy evaluation was not queued prediction_ids=%s reason=%s",
-                prediction_ids, report.get("reason") or "unknown",
-            )
+    def _postprocess_prediction_window_expiration_task(self, event: Dict[str, Any]) -> None:
+        with self._prediction_lock:
+            self._prediction_window_expiration_pending = False
+
+    def _postprocess_prediction_reassessment_task(self, event: Dict[str, Any]) -> None:
+        with self._prediction_lock:
+            try:
+                if event.get("succeeded"):
+                    self._prediction_reassessment_retry_at = 0.0
+                else:
+                    # Replays use their logical clock; real-time retries wait
+                    # from completion, not from the start of a slow LLM call.
+                    reference = (event.get("payload") or {}).get("reference_timestamp")
+                    now = datetime.now().astimezone()
+                    if reference is not None:
+                        try:
+                            now = datetime.fromisoformat(str(reference).replace("Z", "+00:00"))
+                        except ValueError:
+                            self._logger.warning("Invalid reassessment retry timestamp: %r", reference)
+                    self._prediction_reassessment_retry_at = (
+                        now.timestamp() + self._prediction_reassessment_retry_seconds
+                    )
+            finally:
+                self._prediction_reassessment_pending = False
 
     def _postprocess_user_state_update_from_user_claims_task(
         self, event: Dict[str, Any],
@@ -1205,7 +1327,7 @@ class TaskScheduler:
                 or completion.get("force_requested"))):
             self.drain_pending_user_state_claims()
 
-    def _postprocess_fact_followup_task(
+    def _postprocess_signal_update_task(
         self, event: Dict[str, Any],
     ) -> None:
         """Acknowledge the signal IDs completed by this task's handler."""
@@ -1232,7 +1354,7 @@ class TaskScheduler:
                 result["_completed_signal_ids"] = []
             raise
         finally:
-            self._postprocess_fact_followup_task(event)
+            self._postprocess_signal_update_task(event)
 
     def _schedule_after_user_observed_pattern_update_task(
         self, event: Dict[str, Any], completion: Dict[str, Any],
@@ -1320,55 +1442,39 @@ class TaskScheduler:
             contains_interaction,
             context.get("input_time_end") or "",
         )
-        for kind, stats in signal_stats.items():
-            if stats["signal_count"] <= 0 or stats["signal_fact_count"] <= 0:
-                continue
-            state = self._fact_followup_state[kind]
-            state["generation"] += 1
-            state["unscheduled_signal_batches"] += 1
-            state["unscheduled_signal_facts"] += stats["signal_fact_count"]
-            state["unscheduled_contains_interaction"] = bool(
-                state["unscheduled_contains_interaction"] or contains_interaction
-            )
 
-    def _schedule_fact_followup_if_eligible(self, kind: str) -> None:
-        state = self._fact_followup_state[kind]
-        mode = "interaction" if state["unscheduled_contains_interaction"] else "default"
-        threshold = self._fact_followup_thresholds[kind][mode]
-        if (
-            state["unscheduled_signal_batches"] < threshold["batches"]
-            or state["unscheduled_signal_facts"] < threshold["facts"]
-        ):
+    def _schedule_signal_updates_for_activity_window(self, result: Dict[str, Any]) -> None:
+        """Freeze unreserved signal IDs belonging to this completed window."""
+        if self._user_memory_db is None or self._task_execution_db is None:
             return
-        target_generation = int(state["generation"])
-        with self._worker_lock:
-            reference_timestamp = self._latest_input_time_end
-        followup_payload: Dict[str, Any] = {
-            "reference_timestamp": reference_timestamp or None,
+        source_ids = result.get("source_segment_ids") or []
+        activity_ids = result.get("user_activity_item_ids") or []
+        signals = self._user_memory_db.get_user_signal_batches_for_activity_window(
+            source_segment_ids=source_ids, activity_ids=activity_ids,
+        )
+        reference_timestamp = result.get("reference_timestamp") or self._latest_input_time_end or None
+        signal_keys = {
+            "memory_user_claim_update": "claim_signal_ids",
+            "memory_user_observed_pattern_update": "action_signal_ids",
+            "memory_user_intent_update": "intent_signal_ids",
         }
-        report = self.submit(
-            kind,
-            followup_payload,
-            report_payload=followup_payload,
-        )
-        if report.get("queued"):
-            state["unscheduled_signal_batches"] = 0
-            state["unscheduled_signal_facts"] = 0
-            state["unscheduled_contains_interaction"] = False
+        for kind in self._SIGNAL_UPDATE_TASK_KINDS:
+            if not self._task_enabled[kind]:
+                continue
+            pending_ids = set(self._task_execution_db.pending_signal_ids(self._SIGNAL_TASK_TARGETS[kind]))
+            selected_ids = sorted(set(signals[signal_keys[kind]]) & pending_ids)
+            if not selected_ids:
+                continue
+            payload = {"signal_ids": selected_ids, "reference_timestamp": reference_timestamp}
+            report = self.submit(kind, payload)
             self._logger.info(
-                "memory fact follow-up task scheduled kind=%s target_generation=%s "
-                "reference_timestamp=%s", kind, target_generation,
-                reference_timestamp or "",
+                "activity-window signal update kind=%s signal_ids=%s "
+                "source_segment_ids=%s activity_ids=%s reference_timestamp=%s queued=%s reason=%s",
+                kind, selected_ids, source_ids, activity_ids, reference_timestamp,
+                bool(report.get("queued")), report.get("reason") or "",
             )
-            return
-        if report.get("reason") == "no_pending_signals":
-            state["unscheduled_signal_batches"] = 0
-            state["unscheduled_signal_facts"] = 0
-            state["unscheduled_contains_interaction"] = False
-        self._logger.warning(
-            "memory fact follow-up task rejected kind=%s reason=%s",
-            kind, report.get("reason"),
-        )
+            if not report.get("queued"):
+                self._logger.warning("Activity-window signal update not queued: %s", report)
 
     def _record_input_time_end(self, value: Any) -> None:
         """Advance the input watermark while submit() holds _worker_lock."""

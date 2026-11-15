@@ -82,7 +82,7 @@ test('a failed signal does not stop the clock', async () => {
 })
 
 test('PWM timer configuration is independent of claim counts', () => {
-  assert.deepEqual(desktopPwmPeriodicTasks({}), [{ taskId: 'user_state_from_claims', intervalMs: 1_800_000 }])
+  assert.deepEqual(desktopPwmPeriodicTasks({}), [{ taskId: 'user_state_from_claims', intervalMs: 1_200_000 }])
   assert.deepEqual(desktopPwmPeriodicTasks({ QWEN_AUDIO_PWM_USER_STATE_INTERVAL_SECONDS: '0' }), [])
   assert.equal(desktopPwmPeriodicTasks({ QWEN_AUDIO_PWM_USER_STATE_INTERVAL_SECONDS: '60' })[0].intervalMs, 60_000)
   assert.throws(() => desktopPwmPeriodicTasks({ QWEN_AUDIO_PWM_USER_STATE_INTERVAL_SECONDS: 'invalid' }))

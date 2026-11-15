@@ -3,7 +3,7 @@ import { gatewayFetch } from '../gateway-transport.js'
 import { t } from '../i18n.js'
 import { memoryListQuery } from './inspection-query.js'
 import {
-  ACTIVITY_ROLES, SECTIONS, DOMAINS, STATUSES, TYPES, activityRoleLabel, domainLabel, eventChanges, evidenceLabel,
+  ACTIVITY_ROLES, SECTIONS, DOMAINS, STATUSES, INTENT_STATUS_KEYS, TYPES, activityRoleLabel, domainLabel, eventChanges, evidenceLabel,
   formatTime, inspectionError, operationLabel, recordFields, statusLabel,
   titleFor, typeLabel, validityLabel, isActivity, observationWindow,
 } from './presentation.js'
@@ -253,7 +253,7 @@ export default function MemoryCenter() {
             <label>{t('状态')}<select aria-label={t('状态')} value={status} onChange={event => resetFilter(setStatus, event.target.value)}>
               <option value="">{t('全部状态')}</option>
               {Object.entries(STATUSES).filter(([key]) => section === 'states'
-                ? ['active', 'weakened', 'expired'].includes(key) : !['weakened', 'expired'].includes(key))
+                ? ['active', 'weakened', 'expired'].includes(key) : INTENT_STATUS_KEYS.includes(key))
                 .map(([key, label]) => <option value={key} key={key}>{t(label)}</option>)}
             </select></label>
             <label>{t('领域')}<select aria-label={t('领域')} value={domain} onChange={event => resetFilter(setDomain, event.target.value)}>

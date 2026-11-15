@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -13,13 +14,16 @@ from memory.memory_database import UserMemoryDB
 from memory.memory_manager import MemoryNodeManager
 from memory.memory_runtime import MemoryRuntime
 from task_scheduler import TaskOperationReporter, TaskScheduler
-from user_model import (
-    UserModelDB, UserPrediction, UserProactiveService, UserStateResolver,
-)
+from user_model.user_model_database import UserModelDB
+from user_model.user_prediction import UserPrediction
+from user_model.user_proactive_service import UserProactiveService
+from user_model.user_state_resolver import UserStateResolver
 
 
 class PersonWorldModel:
     """Own the shared memory worker, evidence runtime, and user model."""
+
+    PROACTIVE_SERVICE_FEEDBACK_TASK_KIND = "proactive_service_feedback"
 
     def __init__(
         self,
@@ -67,12 +71,12 @@ class PersonWorldModel:
                 logger=self._logging_manager.get_logger("llm_client"),
             )
             # Both memory and user-state handlers are registered before the
-            # shared worker starts processing its FIFO.
+            # shared worker starts processing its priority queue.
             self._task_scheduler = TaskScheduler(
                 operation_reporter=self._operation_reporter,
                 maxsize=int(scheduler_config.get("task_queue_maxsize", 100) or 100),
                 logger=self._logging_manager.get_logger("task_scheduler"),
-                claim_state_database=self._user_memory_database,
+                user_memory_db=self._user_memory_database,
                 task_scheduling_config=scheduler_config,
                 memory_enabled=manager_config.get("memory_enabled", True),
             )
@@ -116,6 +120,10 @@ class PersonWorldModel:
                 llm_client=self._llm_client,
                 world_owner_entity_name=self._memory_runtime.manager.world_owner_entity_name,
                 logger=self._logging_manager.get_logger("user_proactive_service"),
+            )
+            self._task_scheduler.register_handler(
+                self.PROACTIVE_SERVICE_FEEDBACK_TASK_KIND,
+                self._process_proactive_service_feedback_task,
             )
             self._memory_runtime.manager.initialize_embedding_cache()
             self._task_scheduler.start()
@@ -225,7 +233,7 @@ class PersonWorldModel:
         subreports = [
             input_flush,
             input_flush.get("user_activity") or {},
-            input_flush.get("fact_followup_dispatch") or {},
+            input_flush.get("signal_update_dispatch") or {},
         ]
         if bool(report.get("accepted", False)) and not any(
             item.get("reason") in {
@@ -245,6 +253,8 @@ class PersonWorldModel:
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("PWM is closed")
         return self._memory_runtime.trigger_memory_recall(
             query,
             tags=tags,
@@ -257,6 +267,14 @@ class PersonWorldModel:
     def trigger_user_state_update(self) -> Dict[str, Any]:
         """Check persisted claims on a host signal and enqueue their state update."""
         return self._task_scheduler.trigger_user_state_update()
+
+    def trigger_user_prediction_time_tick(
+        self, *, reference_timestamp: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Queue expiration and defer reassessment on the shared worker."""
+        return self._task_scheduler.trigger_user_prediction_time_tick(
+            reference_timestamp=reference_timestamp,
+        )
 
     def drain_pending_user_state_claims(self) -> Dict[str, Any]:
         return self._task_scheduler.drain_pending_user_state_claims()
@@ -282,17 +300,99 @@ class PersonWorldModel:
         with self._task_scheduler.execution_lock:
             return self._user_prediction.get_active_predictions(as_of=as_of)
 
-    def record_prediction_outcome(
-        self, *, prediction_id: int, status: str,
-        observed_at: Optional[datetime] = None,
-        evidence_refs: Optional[Sequence[Dict[str, Any]]] = None,
-        note: str = "",
-    ) -> bool:
-        with self._task_scheduler.execution_lock:
-            return self._user_prediction.record_prediction_outcome(
-                prediction_id=prediction_id, status=status,
-                observed_at=observed_at, evidence_refs=evidence_refs, note=note,
+    def accept_proactive_service_feedback(
+        self, *, service_id: int, execution_id: str, execution_status: str,
+        user_response: str = "unknown", user_feedback: str = "",
+        execution_result: Optional[Dict[str, Any]] = None,
+        agent_note: str = "", observed_at: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Record and extract one report on the shared worker, then return its result.
+
+        execution_id identifies the external Agent's run. user_feedback must
+        be the user's actual words; execution_result is JSON-compatible Agent/
+        tool output, while agent_note is interpretation, not memory evidence.
+        A failed memory_status does not discard the recorded raw feedback.
+        Follow-up claim/intent/state work remains asynchronous and follows the
+        existing scheduler thresholds. No dialogue deduplication is performed.
+        """
+        if self._closed:
+            raise RuntimeError("PWM is closed")
+        report = self._task_scheduler.submit_and_wait(
+            self.PROACTIVE_SERVICE_FEEDBACK_TASK_KIND,
+            deepcopy({
+                "service_id": service_id, "execution_id": execution_id,
+                "execution_status": execution_status, "user_response": user_response,
+                "user_feedback": user_feedback, "execution_result": execution_result,
+                "agent_note": agent_note, "observed_at": observed_at,
+            }),
+        )
+        if report.get("fact_ids"):
+            # Ensure finalize/close can drain below-threshold feedback signals,
+            # even if no ordinary conversation has entered MemoryRuntime.
+            self._memory_inputs_need_flush = True
+        return report
+
+    def _process_proactive_service_feedback_task(self, **payload: Any) -> Dict[str, Any]:
+        """Coordinate service records and memory extraction, not domain decisions."""
+        feedback = self._user_proactive_service.record_service_feedback(**payload)
+        try:
+            memory = self.memory_manager.extract_memory_from_proactive_service_feedback(feedback)
+        except Exception as exc:
+            self._logger.exception(
+                "Service feedback memory extraction failed feedback_id=%s service_id=%s; raw report retained",
+                feedback["id"], feedback["service_id"],
             )
+            memory = {"status": "failed", "reason": "feedback_memory_extraction_error",
+                      "error_type": type(exc).__name__, "fact_ids": [], "new_fact_count": 0}
+        report = {
+            **memory,
+            "status": "failed" if memory["status"] == "failed" else "ok",
+            "memory_status": memory["status"], "feedback_recorded": True,
+            "feedback_id": feedback["id"], "service_id": feedback["service_id"],
+            "execution_id": feedback["execution_id"],
+            "reference_timestamp": feedback["observed_at"],
+            "contains_interaction_turn": bool(feedback["user_feedback"].strip()),
+        }
+        self._logger.info(
+            "Service feedback processed feedback_id=%s service_id=%s status=%s memory_status=%s fact_ids=%s",
+            report["feedback_id"], report["service_id"], report["status"],
+            report["memory_status"], report.get("fact_ids", []),
+        )
+        return report
+
+    def get_proactive_service_feedback(
+        self, *, service_id: Optional[int] = None, limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        with self._task_scheduler.execution_lock:
+            return self._user_proactive_service.get_service_feedback(service_id=service_id, limit=limit)
+
+    def generate_proactive_services_from_predictions(
+        self, *, runtime_context: Optional[Dict[str, Any]] = None,
+        agent_capabilities: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Optional[Any] = None,
+        max_predictions: int = 10,
+    ) -> Dict[str, Any]:
+        """Host-driven assessment; return current help, not a queue receipt.
+
+        Queues at highest priority, waits for this task, and returns assistance.
+        Does not interrupt a running task or flush background work. Waiting
+        services are persisted internally; no tools are executed.
+        """
+        if self._closed:
+            raise RuntimeError("PWM is closed")
+        if runtime_context is not None and not isinstance(runtime_context, dict):
+            raise ValueError("runtime_context must be an object")
+        if agent_capabilities is not None and not isinstance(agent_capabilities, dict):
+            raise ValueError("agent_capabilities must be an object")
+        return self._task_scheduler.submit_and_wait(
+            UserProactiveService.TASK_KIND,
+            {
+                "runtime_context": deepcopy(runtime_context),
+                "agent_capabilities": deepcopy(agent_capabilities),
+                "reference_timestamp": reference_timestamp,
+                "max_predictions": max_predictions,
+            },
+        )
 
     def get_proactive_services(
         self, *, statuses: Optional[Sequence[str]] = None, limit: int = 100,
