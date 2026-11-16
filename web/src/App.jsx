@@ -181,9 +181,28 @@ function OrbControlIcon({ type, muted = false, collapsed = false }) {
       <circle cx="12" cy="12" r="5.5" />
     </svg>
   }
+  if (type === 'devlab') {
+    // Little experiment flask: a dev-only shortcut into the creative lab.
+    return <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M9.5 3h5M10.5 3v6.2L5.6 18a2 2 0 0 0 1.7 3h9.4a2 2 0 0 0 1.7-3l-4.9-8.8V3" />
+      <path d="M7.5 15h9" />
+    </svg>
+  }
   return <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="m7 7 10 10M17 7 7 17" />
   </svg>
+}
+
+function openDevLabView() {
+  // Desktop has a dedicated, shortcut-addressable DevLab window. Plain web
+  // falls back to a new tab so the current conversation is never lost.
+  if (typeof window.qwenAudioAgentDesktop?.openDevLab === 'function') {
+    window.qwenAudioAgentDesktop.openDevLab()
+    return
+  }
+  const url = new URL(window.location.href)
+  url.searchParams.set('view', 'debug')
+  window.open(url.toString(), '_blank', 'noopener,noreferrer')
 }
 
 function upsertTask(items, taskId, update, fallback) {
@@ -1431,6 +1450,16 @@ export default function App() {
           >
             <OrbControlIcon type="memory" />
           </button>
+          <button
+            onClick={event => {
+              event.stopPropagation()
+              openDevLabView()
+            }}
+            aria-label={t('🧪 实验台')}
+            title={t('🧪 实验台')}
+          >
+            <OrbControlIcon type="devlab" />
+          </button>
           {desktopCards.length > 0 && <button
             onClick={event => {
               event.stopPropagation()
@@ -1576,6 +1605,12 @@ export default function App() {
           {t('资料库')}
         </button>
       )}
+      <button
+        className="ghost devlab-entry"
+        onClick={openDevLabView}
+        title={t('打开创意实验与调试面板')}
+        aria-label={t('🧪 实验台')}
+      >🧪 {t('实验台')}</button>
       <button
         className={`ghost${desktopOrbMode ? ' desktop-new-session' : ''}`}
         onClick={resetSession}

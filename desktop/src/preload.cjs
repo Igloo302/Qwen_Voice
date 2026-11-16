@@ -31,6 +31,7 @@ contextBridge.exposeInMainWorld('qwenAudioAgentDesktop', {
   },
   openSettings: () => ipcRenderer.send('qwen-audio-agent:open-settings'),
   openMemory: () => ipcRenderer.send('qwen-audio-agent:open-memory'),
+  openDevLab: () => ipcRenderer.send('qwen-audio-agent:open-devlab'),
   loadSurface: () => ipcRenderer.invoke('qwen-audio-agent:surface-load'),
   setSurface: mode => ipcRenderer.invoke(
     'qwen-audio-agent:surface-set',

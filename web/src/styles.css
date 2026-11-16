@@ -403,6 +403,8 @@ header button { padding: 9px 13px; border-radius: 10px; color: #ddd; border: 1px
 header .voice.active { color: white; border-color: #785cf4; background: #785cf4; }
 header .voice.waiting { color: #ded5ff; border-color: #927cf480; }
 header .ghost.active { color: white; border-color: #785cf480; background: #785cf42e; }
+header .devlab-entry { color: #e3c884; border-color: #c8a55b4d; background: #c8a55b12; }
+header .devlab-entry:hover { color: #fff2d4; border-color: #c8a55b99; background: #c8a55b26; }
 
 /* 资料库面板：夹在 header 与主对话区之间，可折叠，不抢对话的位置 */
 .knowledge-panel {

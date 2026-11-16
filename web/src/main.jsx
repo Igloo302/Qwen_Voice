@@ -2,15 +2,17 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App.jsx'
 import MemoryCenter from './memory/MemoryCenter.jsx'
+import DevLabCenter from './devlab/DevLabCenter.jsx'
 import { setRuntimeLanguage, t } from './i18n.js'
 import './styles.css'
 
 const parameters = new URLSearchParams(window.location.search)
 const memoryView = parameters.get('view') === 'memory'
-if (memoryView) {
-  document.documentElement.dataset.view = 'memory'
+const devLabView = ['debug', 'lab'].includes(parameters.get('view'))
+if (memoryView || devLabView) {
+  document.documentElement.dataset.view = memoryView ? 'memory' : 'debug'
   setRuntimeLanguage(parameters.get('lang') || navigator.language)
-  document.title = t('我的记忆')
+  document.title = t(memoryView ? '我的记忆' : '🧪 创意实验室 (DevLab)')
 }
 
 if (parameters.get('desktop') === 'orb') {
@@ -19,6 +21,8 @@ if (parameters.get('desktop') === 'orb') {
 
 createRoot(document.getElementById('root')).render(
   <StrictMode>
-    {memoryView ? <MemoryCenter /> : <App />}
+    {devLabView
+      ? <DevLabCenter />
+      : memoryView ? <MemoryCenter /> : <App />}
   </StrictMode>,
 )

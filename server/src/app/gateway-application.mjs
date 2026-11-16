@@ -2,6 +2,7 @@ import { registerMemoryResetRoutes } from '../conversation/memory/reset-api.mjs'
 import { registerFeishuImportRoutes } from '../conversation/memory/feishu-import-api.mjs'
 import { registerMemoryInspectionRoutes } from '../conversation/memory/inspection-api.mjs'
 import { registerMemoryPeriodicTaskRoutes } from '../conversation/memory/periodic-task-api.mjs'
+import { registerDevLabRoutes } from '../conversation/memory/devlab-api.mjs'
 import express from 'express'
 import { PERMISSION_DECISIONS } from '../core/work-authorization.mjs'
 import { createServer } from 'http'
@@ -795,6 +796,11 @@ registerMemoryResetRoutes(app, { memory: frontendMemoryRuntime })
 registerFeishuImportRoutes(app, { memory: frontendMemoryRuntime })
 registerMemoryInspectionRoutes(app, { memory: frontendMemoryRuntime })
 registerMemoryPeriodicTaskRoutes(app, { memory: frontendMemoryRuntime })
+
+// DevLab is an opt-in debug surface for creative field experiments. It shares
+// the authenticated Gateway (same-origin + bearer relay) but not the memory
+// provider: its data lives in the Python side-car's own JSON artifacts.
+registerDevLabRoutes(app, { logger })
 
 app.get('/api/memory', (req, res, next) => {
   if (!frontendMemoryRuntime) {

@@ -250,6 +250,7 @@ let desktopPreWakeContextRuntime = null
 let desktopPendingPreWakeContext = ''
 let desktopPreWakeContextCapturing = false
 let desktopWakeWordPending = false
+const DEVLAB_SHORTCUT = 'CommandOrControl+Alt+D'
 const memoryWindow = createMemoryWindowController({
   BrowserWindow,
   getUrl: () => {
@@ -261,6 +262,19 @@ const memoryWindow = createMemoryWindowController({
   getTitle: () => desktopText('我的记忆'),
   getWorkArea: () => screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea,
   onError: error => logger.warn('desktop.memory_window.failed', { error }),
+})
+const devLabWindow = createMemoryWindowController({
+  BrowserWindow,
+  getUrl: () => {
+    const url = new URL(rendererServer.baseUrl)
+    url.searchParams.set('view', 'debug')
+    url.searchParams.set('lang', effectiveDesktopLanguage(desktopLanguage, app.getLocale()))
+    return url.href
+  },
+  getTitle: () => '🧪 创意实验室 (DevLab)',
+  getWorkArea: () => screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea,
+  view: 'debug',
+  onError: error => logger.warn('desktop.devlab_window.failed', { error }),
 })
 let desktopAmbientRecordingRuntime = null
 let desktopAmbientRecordingId = ''
@@ -1284,6 +1298,19 @@ ipcMain.on('qwen-audio-agent:open-memory', event => {
   if (mainWindow && event.sender === mainWindow.webContents) void showMemoryWindow()
 })
 
+async function showDevLabWindow() {
+  if (setupRequired) {
+    showSettings()
+    return
+  }
+  await ensureDesktopUi()
+  await devLabWindow.open()
+}
+
+ipcMain.on('qwen-audio-agent:open-devlab', event => {
+  if (mainWindow && event.sender === mainWindow.webContents) void showDevLabWindow()
+})
+
 function createTray() {
   if (!tray) {
     const iconPath = resolve(
@@ -1308,6 +1335,10 @@ function createTray() {
     {
       label: desktopText('我的记忆'),
       click: () => { void showMemoryWindow() },
+    },
+    {
+      label: '🧪 创意实验室 (DevLab)',
+      click: () => { void showDevLabWindow() },
     },
     {
       label: desktopText('设置…'),
@@ -1990,7 +2021,9 @@ async function applyDesktopSettings(settings) {
     sendDesktopClientSettings(mainWindow, normalized)
   }
   // Refresh the read-only view after switching Gateway identity or language.
-  if (gatewayChanged || credentialChanged || languageChanged) await memoryWindow.reload()
+  if (gatewayChanged || credentialChanged || languageChanged) {
+    await Promise.all([memoryWindow.reload(), devLabWindow.reload()])
+  }
   const runtime = await runtimeStatus(appOrigin)
   return {
     settings: publicPwmSettings(normalized),
@@ -2133,6 +2166,9 @@ if (!app.requestSingleInstanceLock()) {
         accelerator: initialSettings.wakeShortcut,
       })
     }
+    if (!globalShortcut.register(DEVLAB_SHORTCUT, () => { void showDevLabWindow() })) {
+      logger.warn('desktop.devlab_shortcut_unavailable', { accelerator: DEVLAB_SHORTCUT })
+    }
     desktopUpdater = createDesktopUpdater({
       currentVersion: app.getVersion(),
       enabled: app.isPackaged,
@@ -2191,6 +2227,8 @@ if (!app.requestSingleInstanceLock()) {
       desktopPeriodicTasks?.stop()
       if (desktopPeriodicTasks) powerMonitor.removeListener('resume', desktopPeriodicTasks.check)
       memoryWindow.close()
+      devLabWindow.close()
+      globalShortcut.unregister(DEVLAB_SHORTCUT)
       desktopPresence.destroy()
       desktopWakeWord.stop()
       stopAmbientRecordingDrainTimer()

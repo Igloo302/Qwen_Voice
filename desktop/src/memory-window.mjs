@@ -5,6 +5,9 @@ export function createMemoryWindowController({
   getUrl,
   getTitle,
   getWorkArea = () => ({ width: 1200, height: 900 }),
+  // Which `view` query value this window is allowed to navigate to. The
+  // DevLab reuses the same controller but must not be redirected to memory.
+  view = 'memory',
   onError = () => {},
 }) {
   let window = null
@@ -37,7 +40,7 @@ export function createMemoryWindowController({
           const allowed = new URL(getUrl())
           const candidate = new URL(value)
           if (candidate.origin !== allowed.origin || candidate.pathname !== allowed.pathname
-            || candidate.searchParams.get('view') !== 'memory') event.preventDefault()
+            || candidate.searchParams.get('view') !== view) event.preventDefault()
         })
         target.on('closed', () => { if (window === target) window = null })
         await load(target)
