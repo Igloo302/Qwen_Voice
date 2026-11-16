@@ -41,11 +41,17 @@ from typing import Any, Dict, List, Optional
 # any caller.
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]  # .../memory
 _SRC_ROOT = _SERVICE_ROOT / "src"
-if str(_SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SRC_ROOT))
+_SERVICE_DIR = Path(__file__).resolve().parent
+for _extra_root in (_SRC_ROOT, _SERVICE_DIR):
+    if str(_extra_root) not in sys.path:
+        sys.path.insert(0, str(_extra_root))
 
 from config import split_memory_config  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
+from crystallized_memory_helper import (  # noqa: E402
+    format_memory_context_for_prompt,
+    get_crystallized_memory_context,
+)
 
 
 DEFAULT_ENV_PATH = Path("~/.config/qwaudio/config.env").expanduser()
@@ -78,7 +84,9 @@ SYSTEM_PROMPT = """你是一位「见过 1000 个平庸项目的硬核极客投�
 也能毫不留情地把它吹上天的地方戳出洞来。你的风格是：辛辣、毒舌、极客式一针见血，
 幽默但不客气，挑剔但不空洞。拒绝温吞客套，拒绝「这个想法很好，但是……」式的废话。
 
-你刚刚读完一段佩戴者（speaker_0）刚结束的语音对白或自言自语。你的任务是判断：
+你刚刚读完一段佩戴者（speaker_0）刚结束的语音对白或自言自语，以及从「个人世界模型」蒸馏出的
+高阶认知记忆：佩戴者正在推进的**真实项目主线清单 (active_threads)** 与**当下焦点 (situational_states)**。
+这些记忆是从长期记忆中提炼出的真实业务，不是随口闲聊。你的任务是判断：
 **佩戴者本人是否主动说出了一个真正的新想法、新点子、产品设计构思或假设。**
 
 【铁律 · 违反即失败】
@@ -99,9 +107,13 @@ SYSTEM_PROMPT = """你是一位「见过 1000 个平庸项目的硬核极客投�
 - pros: 真正诱人之处与创新点，指出它为什么不是又一个平庸 App。
 - cons: 致命盲点与自嗨陷阱，用毒舌把技术、成本、伦理或人性上的硬伤钉死，拒绝温吞客套。
 - extension: 顺着这个逻辑推演到极致的脑洞，越荒诞越要写得像真能做出来的路线图。
-- relevance: 与佩戴者当下在做的事（AI 硬件、眼镜产品、技术探索）的现实关联，
-  说清这是真下一步还是纯自我感动。
-- spicy_verdict: 一句字字诛心却醍醐灌顶的毒舌终审评语，像投资人当面把 BP 摔在桌上。
+- relevance: 【必须锚定真实主线】直接批判该灵感与佩戴者手头正在推进的项目主线
+  （如《空间屏应用与Device SDK交付》《面向未来 AI 眼镜的实验性项目》）以及当下处境焦点
+  （如交付节点将至、外部依赖卡住）的真实关系——它究竟能直接补齐哪块关键拼图，还是
+  在交付迫在眉睫时又一次典型的自我感动、逃避式脑洞、用新点子掩盖旧债？必须点名至少一条
+  真实主线标题，不许泛泛而谈「与正在做的事有关」。
+- spicy_verdict: 【必须结合具体项目处境】一句字字诛心却醍醐灌顶的毒舌终审评语，
+  把灵感与佩戴者真实交付压力的碰撞钉死，像投资人当面把 BP 摔在桌上。
 - reality_check: 一个最小、可在 48 小时内完成的试金石挑战，用来验真或当众打脸。
 
 请严格输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释性前后缀。
@@ -266,15 +278,27 @@ class SparkCaptureService:
             return None
         return data if isinstance(data, dict) else None
 
-    def _call_llm(self, transcript: str, llm_client: LLMClient) -> Optional[Dict[str, Any]]:
-        prompt = (
-            SYSTEM_PROMPT
-            + "\n\n---\n\n"
-            + "以下是刚结束的对白（speaker_0 是佩戴者本人，也是唯一可能的灵感来源；"
-            + "speaker_1 是外部发言人，只能作为背景）。"
-            + "请严格按上面的系统指令判断并只输出一个 JSON 对象：\n\n"
-            + transcript
-        )
+    def _call_llm(
+        self,
+        transcript: str,
+        llm_client: LLMClient,
+        memory_block: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        sections = [SYSTEM_PROMPT, "\n\n---\n\n"]
+        if memory_block:
+            sections.extend([
+                "以下是佩戴者真实推进的项目主线与当下焦点（个人世界模型记忆），"
+                "你的 relevance 与 spicy_verdict 必须锚定这些真实业务：\n\n",
+                memory_block,
+                "\n\n---\n\n",
+            ])
+        sections.extend([
+            "【最近对白与现场原声】（speaker_0 是佩戴者本人，也是唯一可能的灵感来源；"
+            "speaker_1 是外部发言人，只能作为背景）",
+            "请严格按上面的系统指令判断并只输出一个 JSON 对象：\n\n",
+            transcript,
+        ])
+        prompt = "".join(sections)
         raw = llm_client.call_llm(prompt, stage_name=_LLM_STAGE)
         if not raw:
             self._logger.warning("Spark capture LLM stage=%s returned no content", _LLM_STAGE)
@@ -317,6 +341,18 @@ class SparkCaptureService:
             if not record["spicy_verdict"]:
                 record["spicy_verdict"] = "连一句狠话都配不上，这火花大概只是灯光反射。"
         return record
+
+    @staticmethod
+    def _linked_thread_titles(
+        memory_context: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        """List the real project threads this spark should be judged against."""
+        context = memory_context or {}
+        return [
+            str(thread.get("title") or "").strip()
+            for thread in (context.get("active_threads") or [])
+            if isinstance(thread, dict) and thread.get("title")
+        ][:5]
 
     # ------------------------------------------------------------------
     # Persistence + notification
@@ -376,12 +412,14 @@ class SparkCaptureService:
         segments: Optional[List[Dict[str, Any]]] = None,
         source: str = "unspecified",
         llm_client: Optional[LLMClient] = None,
+        memory_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Synchronously generate one spark card. Catches every exception.
 
-        Returns the cleaned record (including ``has_spark: false``) to the
-        caller, but only persists and notifies when a real spark was found —
-        a non-spark must never leave a trace or disturb the wearer.
+        When ``memory_context`` is not injected, crystallized world-model memory
+        is discovered and read automatically (defensively). Returns the cleaned
+        record (including ``has_spark: false``) to the caller, but only persists
+        and notifies when a real spark was found.
         """
         try:
             turns = self.normalize_conversation(messages=messages, segments=segments)
@@ -395,10 +433,20 @@ class SparkCaptureService:
             client = self._resolve_llm_client(llm_client)
             if client is None:
                 return None
-            parsed = self._call_llm(self._format_transcript(turns), client)
+            if memory_context is None:
+                try:
+                    memory_context = get_crystallized_memory_context()
+                except Exception as exc:  # pragma: no cover - defensive boundary
+                    self._logger.debug("Spark crystallized memory unavailable: %s", exc)
+                    memory_context = {}
+            memory_block = format_memory_context_for_prompt(memory_context)
+            parsed = self._call_llm(
+                self._format_transcript(turns), client, memory_block=memory_block,
+            )
             if not parsed:
                 return None
             record: Dict[str, Any] = self._clean_fields(parsed)
+            record["linked_thread_titles"] = self._linked_thread_titles(memory_context)
             record.update({
                 "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "source": source,
@@ -427,13 +475,14 @@ class SparkCaptureService:
         segments: Optional[List[Dict[str, Any]]] = None,
         source: str = "unspecified",
         llm_client: Optional[LLMClient] = None,
+        memory_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[threading.Thread]:
         """Fire-and-forget. Returns the daemon thread (or None on failure)."""
         def runner() -> None:
             try:
                 self.generate_spark(
                     messages=messages, segments=segments, source=source,
-                    llm_client=llm_client,
+                    llm_client=llm_client, memory_context=memory_context,
                 )
             except Exception:  # pragma: no cover - belt and braces
                 self._logger.exception("Spark capture async worker failed")
@@ -497,9 +546,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     for turn in segments:
         label = "佩戴者" if turn["speaker"] == "speaker_0" else "外部"
         print(f"  [{label}] {turn['text']}")
+    context = get_crystallized_memory_context()
+    if context.get("active_threads"):
+        print("\n🔗 锚定真实主线：" + " ｜ ".join(
+            thread.get("title", "") for thread in context["active_threads"][:3]
+        ))
     print("\n正在请求 PWM LLMClient 生成灵感卡片 …\n")
 
-    result = service.generate_spark(segments=segments, source="cli-test")
+    result = service.generate_spark(
+        segments=segments, source="cli-test", memory_context=context,
+    )
     if not result:
         print("未捕获灵感：请检查 PWM 配置/API Key、网络或日志输出。")
         return 1

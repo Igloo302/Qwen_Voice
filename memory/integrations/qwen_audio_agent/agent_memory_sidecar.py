@@ -55,6 +55,7 @@ _MAX_SEEN_IDS = 20_000
 _MAX_DIALOGUE_TURNS = 200
 _MBTI_SERVICE_CLASS = None
 _SPARK_SERVICE_CLASS = None
+_CRYSTALLIZED_CONTEXT_FN = None
 
 
 def _mbti_service_class():
@@ -89,6 +90,23 @@ def _spark_service_class():
         spec.loader.exec_module(module)
         _SPARK_SERVICE_CLASS = module.SparkCaptureService
     return _SPARK_SERVICE_CLASS
+
+
+def _crystallized_context_fn():
+    """Load the read-only crystallized-memory extractor by path."""
+    global _CRYSTALLIZED_CONTEXT_FN
+    if _CRYSTALLIZED_CONTEXT_FN is None:
+        module_path = Path(__file__).resolve().with_name("crystallized_memory_helper.py")
+        spec = importlib.util.spec_from_file_location(
+            "_qwaudio_crystallized_memory_helper", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load crystallized memory helper module")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _CRYSTALLIZED_CONTEXT_FN = module.get_crystallized_memory_context
+    return _CRYSTALLIZED_CONTEXT_FN
 
 
 def _dialogue_turn(speaker: Any, text: Any) -> Optional[Dict[str, Any]]:
@@ -360,6 +378,24 @@ class AgentMemoryRuntime:
         self._owners[key] = created
         return created
 
+    def _holder_memory_context(self, holder: OwnerRuntime) -> Dict[str, Any]:
+        """Read the owner's distilled world-model memory for the creative hooks.
+
+        Uses the exact database paths backing ``holder.pwm`` so the context
+        always reflects this owner's own memory pyramid. Defensive: a missing
+        or corrupt database simply yields an empty context.
+        """
+        try:
+            pwm = holder.pwm
+            extract = _crystallized_context_fn()
+            return extract(
+                memory_db_path=pwm.database.db_path,
+                user_model_db_path=pwm.user_model_database.db_path,
+            ) or {}
+        except Exception as exc:
+            self._logger.debug("crystallized memory hook skipped: %s", exc)
+            return {}
+
     def _trigger_mbti_insight(
         self,
         holder: OwnerRuntime,
@@ -375,11 +411,14 @@ class AgentMemoryRuntime:
             if self._mbti_service is None:
                 self._mbti_service = service_class(logger=self._logger)
             # Reuse the owner's PWM language model so the insight uses exactly
-            # the same model/base_url/api_key/json_mode/thinking as memory.
+            # the same model/base_url/api_key/json_mode/thinking as memory, and
+            # carry the owner's distilled world-model memory into the prompt.
+            memory_context = self._holder_memory_context(holder)
             self._mbti_service.generate_insight_async(
                 segments=turns,
                 source=source,
                 llm_client=holder.pwm.llm_client,
+                memory_context=memory_context,
             )
             self._logger.info(
                 "MBTI insight queued source=%s turns=%s", source, len(turns),
@@ -403,11 +442,14 @@ class AgentMemoryRuntime:
             if self._spark_service is None:
                 self._spark_service = service_class(logger=self._logger)
             # Reuse the owner's PWM language model so critique uses exactly the
-            # same model/base_url/api_key/json_mode/thinking as memory.
+            # same model/base_url/api_key/json_mode/thinking as memory, and
+            # anchor the critique in the owner's real project threads / focus.
+            memory_context = self._holder_memory_context(holder)
             self._spark_service.generate_spark_async(
                 segments=list(turns),
                 source=source,
                 llm_client=holder.pwm.llm_client,
+                memory_context=memory_context,
             )
             self._logger.info(
                 "Spark capture queued source=%s turns=%s", source, len(turns),

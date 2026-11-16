@@ -37,11 +37,17 @@ from typing import Any, Dict, List, Optional
 # Make the import work in both cases without changing either caller.
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]  # .../memory
 _SRC_ROOT = _SERVICE_ROOT / "src"
-if str(_SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SRC_ROOT))
+_SERVICE_DIR = Path(__file__).resolve().parent
+for _extra_root in (_SRC_ROOT, _SERVICE_DIR):
+    if str(_extra_root) not in sys.path:
+        sys.path.insert(0, str(_extra_root))
 
 from config import split_memory_config  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
+from crystallized_memory_helper import (  # noqa: E402
+    format_memory_context_for_prompt,
+    get_crystallized_memory_context,
+)
 
 
 DEFAULT_ENV_PATH = Path("~/.config/qwaudio/config.env").expanduser()
@@ -69,14 +75,18 @@ SYSTEM_PROMPT = """你是一位「随身荣格心理导师」，精通 MBTI 认�
  Fi 内倾情感 / Fe 外倾情感 / Si 内倾感觉 / Se 外倾感觉)、
 荣格心理学原型，以及Conversation中的「心理能量场」。
 
-你刚刚读完一段佩戴者（speaker_0）刚结束的语音对白或会议转录。你的任务不是做事实摘要，
-而是像看穿潜意识一样，读出佩戴者在刚才这场人际博弈中的认知功能运作、妥协、防御机制
-与潜意识张力。风格要求：
+你刚刚读完一段佩戴者（speaker_0）刚结束的语音对白或会议转录，以及从「个人世界模型」蒸馏出的
+高阶认知记忆（佩戴者当前的高阶活动 User Activity、当下处境状态 Situational State、
+正在推进的长期主线 User Threads）。这些记忆是从大量原始语音中提炼出的精华，
+比琐碎对白更能说明佩戴者真实的处境。你的任务不是做事实摘要，而是像看穿潜意识一样，
+读出佩戴者在**具体活动场景与处境重压**下的认知功能运作、妥协、防御机制与潜意识张力。
+风格要求：
 - 神神叨叨却颇有哲理，幽默却一针见血，像禅师又像毒舌老友。
-- 聚焦「人际博弈与心理能量场」：谁在主导、谁在退让、佩戴者用了哪种认知功能
-  来防御或攻击、能量从哪个功能流向哪个功能。
-- 至少点名一个具体的认知功能（如 Fe 过度协调、Ti 冷漠撤离、Ni 宿命感、Ne 逃逸、
-  Fi 价值硬撑、Te 效率压制、Si 经验固执、Se 当下防御），并解释它如何现身。
+- 禁止就几句零星碎语泛泛而论：必须把对白与佩戴者正在参与的活动（如多方利益协调、
+  技术争议、规格文档核对）和其处境（如交付节点将至、外部依赖卡住、时间压力）绑在一起读。
+- 直击八维认知功能的内在博弈与能量流向，例如：Fe 表面妥协 vs Ti 潜意识撤离、
+  Te 强推效率压制 vs Ni 焦虑、Ne 逃逸 vs Si 经验固执、Fi 价值硬撑 vs Fe 关系维护。
+  至少点名两个相互拉扯的具体认知功能，并解释它们如何在这场活动/处境中现身、能量从哪流向哪。
 - 必须围绕佩戴者本人（speaker_0）展开，外部发言只是照见他的镜子。
 - 保持心理隐喻与哲学意味，但不要给出临床诊断，不要涉及自伤或医疗建议。
 
@@ -251,14 +261,26 @@ class MBTIInsightService:
             return None
         return data if isinstance(data, dict) else None
 
-    def _call_llm(self, transcript: str, llm_client: LLMClient) -> Optional[Dict[str, Any]]:
-        prompt = (
-            SYSTEM_PROMPT
-            + "\n\n---\n\n"
-            + "以下是刚结束的对白（speaker_0 是佩戴者本人，speaker_1 是外部发言人）。"
-            + "请严格按上面的系统指令，只输出一个 JSON 对象：\n\n"
-            + transcript
-        )
+    def _call_llm(
+        self,
+        transcript: str,
+        llm_client: LLMClient,
+        memory_block: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        sections = [SYSTEM_PROMPT, "\n\n---\n\n"]
+        if memory_block:
+            sections.extend([
+                "以下是从个人世界模型记忆金字塔中蒸馏出的高阶认知记忆，是本次洞察的核心锚点：\n\n",
+                memory_block,
+                "\n\n---\n\n",
+            ])
+        sections.extend([
+            "【最近对白与现场原声】（speaker_0 是佩戴者本人，speaker_1 是外部发言人；"
+            "原声只作为高阶活动与处境的佐证，不要停留在字面碎语）",
+            "请严格按上面的系统指令，只输出一个 JSON 对象：\n\n",
+            transcript,
+        ])
+        prompt = "".join(sections)
         raw = llm_client.call_llm(prompt, stage_name=_LLM_STAGE)
         if not raw:
             self._logger.warning("MBTI insight LLM stage=%s returned no content", _LLM_STAGE)
@@ -289,6 +311,30 @@ class MBTIInsightService:
         if not result["recommended_action"]:
             result["recommended_action"] = "闭目深呼吸 1 分钟，把刚才没说出口的话在心里说完"
         return result
+
+    @staticmethod
+    def _metadata_from_context(
+        memory_context: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Derive traceable metadata fields from the crystallized context."""
+        context = memory_context or {}
+        latest = context.get("latest_activity") or {}
+        states = context.get("situational_states") or []
+        focus_bits = [
+            str(state.get("state_topic") or "").strip()
+            for state in states if isinstance(state, dict)
+        ]
+        focus_bits = [bit for bit in focus_bits if bit]
+        return {
+            "activity_id": latest.get("id"),
+            "activity_summary": str(latest.get("activity_text") or "").strip(),
+            "situational_focus": "；".join(focus_bits[:3]),
+            "active_thread_titles": [
+                str(thread.get("title") or "").strip()
+                for thread in (context.get("active_threads") or [])
+                if isinstance(thread, dict) and thread.get("title")
+            ][:5],
+        }
 
     # ------------------------------------------------------------------
     # Persistence + notification
@@ -348,8 +394,13 @@ class MBTIInsightService:
         segments: Optional[List[Dict[str, Any]]] = None,
         source: str = "unspecified",
         llm_client: Optional[LLMClient] = None,
+        memory_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Synchronously generate one insight. Catches every exception."""
+        """Synchronously generate one insight. Catches every exception.
+
+        When ``memory_context`` is not injected, the crystallized world-model
+        memory is discovered and read automatically (defensively).
+        """
         try:
             turns = self.normalize_conversation(messages=messages, segments=segments)
             if not turns:
@@ -358,10 +409,20 @@ class MBTIInsightService:
             client = self._resolve_llm_client(llm_client)
             if client is None:
                 return None
-            parsed = self._call_llm(self._format_transcript(turns), client)
+            if memory_context is None:
+                try:
+                    memory_context = get_crystallized_memory_context()
+                except Exception as exc:  # pragma: no cover - defensive boundary
+                    self._logger.debug("MBTI crystallized memory unavailable: %s", exc)
+                    memory_context = {}
+            memory_block = format_memory_context_for_prompt(memory_context)
+            parsed = self._call_llm(
+                self._format_transcript(turns), client, memory_block=memory_block,
+            )
             if not parsed:
                 return None
             record: Dict[str, Any] = self._clean_fields(parsed)
+            record.update(self._metadata_from_context(memory_context))
             record.update({
                 "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "source": source,
@@ -387,13 +448,14 @@ class MBTIInsightService:
         segments: Optional[List[Dict[str, Any]]] = None,
         source: str = "unspecified",
         llm_client: Optional[LLMClient] = None,
+        memory_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[threading.Thread]:
         """Fire-and-forget. Returns the daemon thread (or None on failure)."""
         def runner() -> None:
             try:
                 self.generate_insight(
                     messages=messages, segments=segments, source=source,
-                    llm_client=llm_client,
+                    llm_client=llm_client, memory_context=memory_context,
                 )
             except Exception:  # pragma: no cover - belt and braces
                 self._logger.exception("MBTI insight async worker failed")
@@ -458,9 +520,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     for turn in segments:
         label = "佩戴者" if turn["speaker"] == "speaker_0" else "外部"
         print(f"  [{label}] {turn['text']}")
+    context = get_crystallized_memory_context()
+    if context.get("latest_activity"):
+        print(f"\n🧠 锚定高阶活动：{context['latest_activity'].get('activity_text', '')[:80]}")
+    if context.get("situational_states"):
+        print("⚡ 锚定处境焦点：" + "；".join(
+            state.get("state_topic", "") for state in context["situational_states"]
+        ))
     print("\n正在请求 PWM LLMClient 生成场域洞察 …\n")
 
-    result = service.generate_insight(segments=segments, source="cli-test")
+    result = service.generate_insight(
+        segments=segments, source="cli-test", memory_context=context,
+    )
     if not result:
         print("未生成洞察：请检查 PWM 配置/API Key、网络或日志输出。")
         return 1

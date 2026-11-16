@@ -8,7 +8,9 @@ import test from 'node:test'
 import {
   DEVLAB_PRESETS,
   SPARK_PRESETS,
+  emptyCrystallizedContext,
   extractRecentRealDialogue,
+  normalizeCrystallizedContext,
   readAmbientRecordings,
   readInsights,
   readSparks,
@@ -16,6 +18,23 @@ import {
   resolveMode,
   resolveRecordingsDir,
 } from '../server/src/conversation/memory/devlab-api.mjs'
+
+const CRYSTALLIZED_STUB = Object.freeze({
+  latest_activity: {
+    id: 12,
+    activity_text: '佩戴者参与固件与交付讨论',
+    user_role: 'participant',
+    evidence_facts: ['[固件] 优先联系装栋'],
+  },
+  recent_activities: [],
+  active_threads: [
+    { id: 4, title: '空间屏应用与Device SDK交付', current_summary: '20号交付初步版本' },
+    { id: 3, title: '面向未来 AI 眼镜的实验性项目', current_summary: 'AI native 开发模式' },
+  ],
+  situational_states: [
+    { state_topic: '空间屏应用与device_sdk交付推进', state_text: '本周提供可集成内容', conditions: { 时间: '20号交付初步版本' } },
+  ],
+})
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'qwen-devlab-'))
@@ -122,6 +141,21 @@ test('devlab spark reader returns newest first, tolerates broken lines and skips
   assert.equal(readSparks(sparksPath, 1).length, 1)
 })
 
+test('crystallized context normalizer is defensive about malformed payloads', () => {
+  assert.deepEqual(normalizeCrystallizedContext(null), emptyCrystallizedContext())
+  assert.deepEqual(normalizeCrystallizedContext('nope'), emptyCrystallizedContext())
+  const normalized = normalizeCrystallizedContext({
+    latest_activity: { activity_text: '活动' },
+    recent_activities: [null, { id: 1 }],
+    active_threads: 'not-an-array',
+    situational_states: [{ state_topic: '焦点' }],
+  })
+  assert.equal(normalized.latest_activity.activity_text, '活动')
+  assert.equal(normalized.recent_activities.length, 1)
+  assert.deepEqual(normalized.active_threads, [])
+  assert.equal(normalized.situational_states[0].state_topic, '焦点')
+})
+
 test('devlab readers return empty collections when files are absent', t => {
   const { root, recordingsDir } = fixture(t)
   assert.deepEqual(readInsights(join(root, 'missing.jsonl')), [])
@@ -183,6 +217,7 @@ test('devlab routes expose insights, sparks, simulation and ambient endpoints wi
   const sparkObserved = []
   const app = fakeApp()
   registerDevLabRoutes(app, {
+    crystallizedContextLoader: async () => CRYSTALLIZED_STUB,
     insightsPath,
     sparksPath,
     recordingsDir,
@@ -226,6 +261,7 @@ test('devlab routes expose insights, sparks, simulation and ambient endpoints wi
   })
   assert.deepEqual([...app.routes.keys()].sort(), [
     'GET /api/devlab/ambient-recordings',
+    'GET /api/devlab/crystallized-context',
     'GET /api/devlab/insights',
     'GET /api/devlab/sparks',
     'POST /api/devlab/insights/simulate',
@@ -237,6 +273,13 @@ test('devlab routes expose insights, sparks, simulation and ambient endpoints wi
   assert.equal(res.statusCode, 200)
   assert.equal(res.headers['cache-control'], 'no-store')
   assert.equal(res.body.items[0].archetype, '历史原型')
+
+  res = fakeRes()
+  await app.routes.get('GET /api/devlab/crystallized-context')({}, res)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.body.ok, true)
+  assert.equal(res.body.crystallized_context.latest_activity.id, 12)
+  assert.equal(res.body.crystallized_context.active_threads.length, 2)
 
   res = fakeRes()
   app.routes.get('GET /api/devlab/ambient-recordings')({ query: {} }, res)
@@ -366,6 +409,7 @@ test('insights simulate defaults to real mode and refuses filler-only dialogue',
   const observed = []
   const app = fakeApp()
   registerDevLabRoutes(app, {
+    crystallizedContextLoader: async () => CRYSTALLIZED_STUB,
     insightsPath,
     recordingsDir,
     simulate: async payload => {
@@ -397,6 +441,7 @@ test('insights simulate in real mode feeds extracted turns to Python and flags p
   const observed = []
   const app = fakeApp()
   registerDevLabRoutes(app, {
+    crystallizedContextLoader: async () => CRYSTALLIZED_STUB,
     insightsPath,
     recordingsDir,
     simulate: async payload => {
@@ -416,6 +461,9 @@ test('insights simulate in real mode feeds extracted turns to Python and flags p
   assert.match(observed[0].source, /^devlab:real\|/)
   assert.equal(observed[0].segments.length, 3)
   assert.equal(observed[0].segments[0].speaker, 'speaker_0')
+  assert.equal(observed[0].memoryContext.latest_activity.id, 12)
+  assert.equal(res.body.insight.crystallized_context.active_threads.length, 2)
+  assert.equal(res.body.crystallizedContext.active_threads[0].title, '空间屏应用与Device SDK交付')
   assert.equal(res.body.items[0].archetype, '真实场域原型')
 })
 
@@ -424,6 +472,7 @@ test('sparks simulate defaults to real mode and reports no_voice with no transcr
   writeAsr(recordingsDir, 'empty.asr.json', [])
   const app = fakeApp()
   registerDevLabRoutes(app, {
+    crystallizedContextLoader: async () => CRYSTALLIZED_STUB,
     sparksPath,
     recordingsDir,
     sparkSimulate: async () => { throw new Error('should not be called') },
@@ -449,6 +498,7 @@ test('sparks simulate in real mode reports has_spark=false without fabricating a
   const observed = []
   const app = fakeApp()
   registerDevLabRoutes(app, {
+    crystallizedContextLoader: async () => CRYSTALLIZED_STUB,
     sparksPath,
     recordingsDir,
     sparkSimulate: async payload => {
@@ -477,6 +527,7 @@ test('sparks simulate in real mode flags a genuine spark with provenance', async
   ])
   const app = fakeApp()
   registerDevLabRoutes(app, {
+    crystallizedContextLoader: async () => CRYSTALLIZED_STUB,
     sparksPath,
     recordingsDir,
     sparkSimulate: async () => {
@@ -491,4 +542,5 @@ test('sparks simulate in real mode flags a genuine spark with provenance', async
   assert.equal(res.body.success, true)
   assert.equal(res.body.spark.is_real_data, true)
   assert.deepEqual(res.body.spark.source_files, ['idea.asr.json'])
+  assert.equal(res.body.spark.crystallized_context.situational_states.length, 1)
 })

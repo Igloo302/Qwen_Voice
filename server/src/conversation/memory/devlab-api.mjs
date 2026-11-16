@@ -34,6 +34,7 @@ const RECORDINGS_DIR_CANDIDATES = Object.freeze([
 ])
 const DEFAULT_INSIGHT_LIMIT = 50
 const DEFAULT_SIMULATE_TIMEOUT_MS = 180_000
+const CRYSTALLIZED_CONTEXT_TIMEOUT_MS = 15_000
 
 // Minimum evidence required before a real recording is allowed to "become" a
 // field. A single monosyllable ("嗯") or a lone turn is never enough to form an
@@ -268,10 +269,19 @@ function normalizeInsight(record) {
     model: clean(record.model, 120),
     source: clean(record.source, 1_000),
     provider: clean(record.provider, 80),
+    activity_id: record.activity_id ?? null,
+    activity_summary: clean(record.activity_summary, 1_000),
+    situational_focus: clean(record.situational_focus, 1_000),
+    active_thread_titles: Array.isArray(record.active_thread_titles)
+      ? record.active_thread_titles.map(name => clean(name, 200))
+      : [],
     is_real_data: record.is_real_data === true || realSourceFiles(record.source).length > 0,
     source_files: Array.isArray(record.source_files)
       ? record.source_files.map(name => clean(name, 200))
       : realSourceFiles(record.source),
+  }
+  if (record.crystallized_context && typeof record.crystallized_context === 'object') {
+    insight.crystallized_context = normalizeCrystallizedContext(record.crystallized_context)
   }
   const turnCount = Number(record.turn_count)
   insight.turn_count = Number.isSafeInteger(turnCount) && turnCount >= 0 ? turnCount : null
@@ -312,10 +322,16 @@ function normalizeSpark(record) {
     model: clean(record.model, 120),
     source: clean(record.source, 1_000),
     provider: clean(record.provider, 80),
+    linked_thread_titles: Array.isArray(record.linked_thread_titles)
+      ? record.linked_thread_titles.map(name => clean(name, 200))
+      : [],
     is_real_data: record.is_real_data === true || realSourceFiles(record.source).length > 0,
     source_files: Array.isArray(record.source_files)
       ? record.source_files.map(name => clean(name, 200))
       : realSourceFiles(record.source),
+  }
+  if (record.crystallized_context && typeof record.crystallized_context === 'object') {
+    spark.crystallized_context = normalizeCrystallizedContext(record.crystallized_context)
   }
   const turnCount = Number(record.turn_count)
   spark.turn_count = Number.isSafeInteger(turnCount) && turnCount >= 0 ? turnCount : null
@@ -464,6 +480,7 @@ record = service.generate_insight(
     segments=payload.get("segments") or None,
     messages=payload.get("messages") or None,
     source=payload.get("source") or "devlab_simulate",
+    memory_context=payload.get("memoryContext") or None,
 )
 sys.stdout.write(json.dumps(record or {}, ensure_ascii=False) + "\\n")
 `
@@ -494,8 +511,36 @@ record = service.generate_spark(
     segments=payload.get("segments") or None,
     messages=payload.get("messages") or None,
     source=payload.get("source") or "devlab_simulate",
+    memory_context=payload.get("memoryContext") or None,
 )
 sys.stdout.write(json.dumps(record or {}, ensure_ascii=False) + "\\n")
+`
+
+// Read-only extraction of the distilled world-model memory. Kept in a tiny
+// inline Python script so the helper module is the single source of truth for
+// both the side-car and the HTTP surface (no duplicate SQL in Node).
+const PYTHON_CRYSTALLIZED_SCRIPT = `
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+helper_path = repo_root / "memory" / "integrations" / "qwen_audio_agent" / "crystallized_memory_helper.py"
+spec = importlib.util.spec_from_file_location("devlab_crystallized_memory_helper", helper_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+payload = json.loads(sys.argv[2])
+context = module.get_crystallized_memory_context(
+    owner_dir=payload.get("ownerDir") or None,
+    memory_db_path=payload.get("memoryDb") or None,
+    user_model_db_path=payload.get("userModelDb") or None,
+    limit_activities=payload.get("limitActivities") or 3,
+    limit_threads=payload.get("limitThreads") or 5,
+    limit_states=payload.get("limitStates") or 3,
+)
+sys.stdout.write(json.dumps(context, ensure_ascii=False) + "\\n")
 `
 
 export function resolvePythonCommand(options = {}, env = process.env) {
@@ -589,6 +634,87 @@ export function createSparkPythonSimulator(options = {}) {
   })
 }
 
+export function emptyCrystallizedContext() {
+  return {
+    latest_activity: {},
+    recent_activities: [],
+    active_threads: [],
+    situational_states: [],
+  }
+}
+
+// Keep the Python helper's snake_case shape so the same object can be stored
+// on insight/spark records and forwarded to the LLM service unchanged.
+export function normalizeCrystallizedContext(raw) {
+  const empty = emptyCrystallizedContext()
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return empty
+  const safeList = value => (Array.isArray(value)
+    ? value.filter(item => item && typeof item === 'object' && !Array.isArray(item))
+    : [])
+  const latest = raw.latest_activity
+  return {
+    latest_activity: latest && typeof latest === 'object' && !Array.isArray(latest)
+      ? latest
+      : {},
+    recent_activities: safeList(raw.recent_activities),
+    active_threads: safeList(raw.active_threads),
+    situational_states: safeList(raw.situational_states),
+  }
+}
+
+// Never throws: a missing database, corrupt file or Python failure simply
+// yields an empty context so the UI and simulations degrade gracefully.
+export function readCrystallizedContext(options = {}) {
+  const command = resolvePythonCommand(options)
+  const projectRoot = options.projectRoot || PROJECT_ROOT
+  const payload = {
+    ownerDir: options.ownerDir || '',
+    memoryDb: options.memoryDb || '',
+    userModelDb: options.userModelDb || '',
+    limitActivities: options.limitActivities || 3,
+    limitThreads: options.limitThreads || 5,
+    limitStates: options.limitStates || 3,
+  }
+  return new Promise(resolve => {
+    let child
+    try {
+      child = spawn(command, ['-c', PYTHON_CRYSTALLIZED_SCRIPT, projectRoot, JSON.stringify(payload)], {
+        cwd: projectRoot,
+        env: { ...process.env },
+        stdio: ['ignore', 'pipe', 'ignore'],
+      })
+    } catch {
+      resolve(emptyCrystallizedContext())
+      return
+    }
+    let stdout = ''
+    let settled = false
+    const finish = value => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => {
+      try { child.kill() } catch {}
+      finish(emptyCrystallizedContext())
+    }, options.crystallizedContextTimeoutMs || CRYSTALLIZED_CONTEXT_TIMEOUT_MS)
+    timer.unref?.()
+    child.stdout?.on('data', chunk => { stdout = clean(stdout + String(chunk), 200_000) })
+    child.once('error', () => finish(emptyCrystallizedContext()))
+    child.once('close', code => {
+      if (code !== 0) return finish(emptyCrystallizedContext())
+      const line = stdout.split(/\r?\n/u).map(item => item.trim()).filter(Boolean).pop()
+      if (!line) return finish(emptyCrystallizedContext())
+      try {
+        finish(normalizeCrystallizedContext(JSON.parse(line)))
+      } catch {
+        finish(emptyCrystallizedContext())
+      }
+    })
+  })
+}
+
 export function registerDevLabRoutes(app, options = {}) {
   const insightsPath = options.insightsPath || DEFAULT_INSIGHTS_PATH
   const sparksPath = options.sparksPath || DEFAULT_SPARK_PATH
@@ -600,6 +726,19 @@ export function registerDevLabRoutes(app, options = {}) {
   const sparkSimulate = typeof options.sparkSimulate === 'function'
     ? options.sparkSimulate
     : createSparkPythonSimulator(options)
+  const loadCrystallized = typeof options.crystallizedContextLoader === 'function'
+    ? options.crystallizedContextLoader
+    : () => readCrystallizedContext(options)
+
+  app.get('/api/devlab/crystallized-context', async (_req, res) => {
+    res.setHeader('cache-control', 'no-store')
+    try {
+      const crystallized_context = normalizeCrystallizedContext(await loadCrystallized())
+      return res.json({ ok: true, crystallized_context })
+    } catch {
+      return res.json({ ok: false, ...emptyCrystallizedContext() })
+    }
+  })
 
   app.get('/api/devlab/insights', (_req, res) => {
     res.setHeader('cache-control', 'no-store')
@@ -637,18 +776,32 @@ export function registerDevLabRoutes(app, options = {}) {
         })
       }
       const source = buildRealSource(real.fileNames)
+      // Anchor the reading in the distilled world-model pyramid (activities,
+      // threads, situational states) instead of raw ASR noise alone.
+      const crystallized_context = normalizeCrystallizedContext(await loadCrystallized())
       try {
         const raw = await simulate({
           segments: real.turns,
           messages: [],
           source,
           preset: '',
+          memoryContext: crystallized_context,
         })
         if (!raw) return res.status(502).json({ code: 'devlab_simulation_empty' })
-        const insight = { ...raw, is_real_data: true, source_files: real.fileNames }
+        const insight = {
+          ...raw,
+          is_real_data: true,
+          source_files: real.fileNames,
+          crystallized_context,
+        }
         let items = []
         try { items = readInsights(insightsPath, insightLimit) } catch {}
-        return res.json({ success: true, insight, items: markRealItems(items, source, real.fileNames) })
+        return res.json({
+          success: true,
+          insight,
+          crystallizedContext: crystallized_context,
+          items: markRealItems(items, source, real.fileNames),
+        })
       } catch {
         // Never leak raw stderr (paths / credentials) to the UI.
         return res.status(503).json({
@@ -719,12 +872,15 @@ export function registerDevLabRoutes(app, options = {}) {
         })
       }
       const source = buildRealSource(real.fileNames)
+      // Anchor the critique in the wearer's real project threads / focus.
+      const crystallized_context = normalizeCrystallizedContext(await loadCrystallized())
       try {
         const raw = await sparkSimulate({
           segments: real.turns,
           messages: [],
           source,
           preset: '',
+          memoryContext: crystallized_context,
         })
         if (!raw) return res.status(502).json({ code: 'devlab_simulation_empty' })
         // The model judged this to be ordinary business chatter: report the
@@ -737,12 +893,23 @@ export function registerDevLabRoutes(app, options = {}) {
             message: `已分析最近真实对白（包含 ${real.totalTurns} 轮讨论），佩戴者未提出新颖创意或假设，规则判定无灵感火花。`,
             sourceFiles: real.fileNames,
             stats,
+            crystallizedContext: crystallized_context,
           })
         }
-        const spark = { ...raw, is_real_data: true, source_files: real.fileNames }
+        const spark = {
+          ...raw,
+          is_real_data: true,
+          source_files: real.fileNames,
+          crystallized_context,
+        }
         let items = []
         try { items = readSparks(sparksPath, insightLimit) } catch {}
-        return res.json({ success: true, spark, items: markRealItems(items, source, real.fileNames) })
+        return res.json({
+          success: true,
+          spark,
+          crystallizedContext: crystallized_context,
+          items: markRealItems(items, source, real.fileNames),
+        })
       } catch {
         return res.status(503).json({
           code: 'devlab_simulation_unavailable',

@@ -121,6 +121,99 @@ function RuleBanner({ evaluation }) {
   </div>
 }
 
+const ACTIVITY_ROLE_LABELS = {
+  actor: '主导者 · actor',
+  participant: '参与者 · participant',
+  contextual: '背景 · contextual',
+}
+
+function CrystallizedAnchor({ context, loading, error, onRefresh }) {
+  const [open, setOpen] = useState(true)
+  const latest = context?.latest_activity || {}
+  const activities = context?.recent_activities || []
+  const threads = context?.active_threads || []
+  const states = context?.situational_states || []
+  const hasContent = Boolean(latest.activity_text || threads.length || states.length)
+
+  return <section className={`crystal-anchor ${open ? 'open' : ''}`}>
+    <header className="crystal-anchor-head">
+      <button
+        type="button"
+        className="crystal-anchor-toggle"
+        onClick={() => setOpen(value => !value)}
+        aria-expanded={open}
+      >
+        <span className="crystal-icon">🧠</span>
+        <span className="crystal-title">
+          <b>{t('个人世界模型认知基底')}</b>
+          <small>CRYSTALLIZED MEMORY ANCHOR · {t('五层记忆蒸馏金字塔的高维产物')}</small>
+        </span>
+        <span className="crystal-chevron">{open ? '▾' : '▸'}</span>
+      </button>
+      <button type="button" className="devlab-button" onClick={onRefresh} disabled={loading}>
+        {loading ? t('读取中…') : `↻ ${t('刷新基底')}`}
+      </button>
+    </header>
+    {open && <div className="crystal-anchor-body">
+      {error && <div className="devlab-alert" role="alert">⚠ {error}</div>}
+      {!loading && !error && !hasContent && <p className="crystal-empty">
+        {t('尚无结晶记忆：当环境录音被蒸馏为活动、主线与处境后，这里会自动点亮。')}
+      </p>}
+      <div className="crystal-grid">
+        <div className="crystal-section">
+          <h3>{t('🎯 当前高阶活动 · USER ACTIVITY')}</h3>
+          {latest.activity_text
+            ? <div className="crystal-card activity">
+                <p>{latest.activity_text}</p>
+                <div className="crystal-tags">
+                  {latest.user_role && <span className="crystal-tag role">
+                    {t(ACTIVITY_ROLE_LABELS[latest.user_role] || latest.user_role)}
+                  </span>}
+                  {(latest.evidence_facts || []).slice(0, 4).map((fact, index) => (
+                    <span className="crystal-tag fact" key={index}># {fact}</span>
+                  ))}
+                </div>
+                {activities.length > 1 && <small className="crystal-more">
+                  {t('近期活动')}：{activities.slice(1, 3).map(item => item.activity_text).join(' ｜ ')}
+                </small>}
+              </div>
+            : <p className="crystal-muted">—</p>}
+        </div>
+        <div className="crystal-section">
+          <h3>{t('🔗 进行中的主线 · USER THREADS')}</h3>
+          {threads.length
+            ? <ul className="crystal-list">
+                {threads.map(thread => <li key={thread.id || thread.title}>
+                  <b>《{thread.title}》</b>
+                  <p>{thread.current_summary}</p>
+                </li>)}
+              </ul>
+            : <p className="crystal-muted">—</p>}
+        </div>
+        <div className="crystal-section">
+          <h3>{t('⚡ 当前处境焦点 · SITUATIONAL STATE')}</h3>
+          {states.length
+            ? <ul className="crystal-list">
+                {states.map(state => <li key={state.id || state.state_topic}>
+                  <b>{state.state_topic}</b>
+                  <p>{state.state_text}</p>
+                  {state.conditions && typeof state.conditions === 'object'
+                    && Object.keys(state.conditions).length > 0
+                    && <small className="crystal-conditions">
+                      {Object.entries(state.conditions)
+                        .filter(([, value]) => value)
+                        .map(([key, value]) => `${key}: ${value}`)
+                        .join(' · ')}
+                    </small>}
+                </li>)}
+              </ul>
+            : <p className="crystal-muted">—</p>}
+        </div>
+      </div>
+    </div>}
+  </section>
+}
+
 function EmptyState({ icon, title, hint }) {
   return <div className="devlab-empty">
     <div className="devlab-empty-icon">{icon}</div>
@@ -140,6 +233,18 @@ function InsightCard({ item, index }) {
         <time>{formatTime(item.created_at)}</time>
       </div>
     </header>
+    {(item.activity_summary || item.situational_focus || item.active_thread_titles?.length > 0)
+      && <div className="anchor-badges">
+        {item.activity_summary && <span className="anchor-badge activity" title={item.activity_summary}>
+          🎯 {t('锚定活动')}：{item.activity_summary}
+        </span>}
+        {item.situational_focus && <span className="anchor-badge focus" title={item.situational_focus}>
+          ⚡ {t('处境焦点')}：{item.situational_focus}
+        </span>}
+        {item.active_thread_titles?.length > 0 && <span className="anchor-badge thread">
+          🔗 {t('关联主线')}：{item.active_thread_titles.join(' · ')}
+        </span>}
+      </div>}
     <div className="energy-line">
       <span className="energy-dot" />
       <span>{item.field_energy || t('能量场域未记录')}</span>
@@ -204,6 +309,11 @@ function SparkCard({ item, index }) {
         <time>{formatTime(item.created_at)}</time>
       </div>
     </header>
+    {item.linked_thread_titles?.length > 0 && <div className="anchor-badges">
+      <span className="anchor-badge thread" title={item.linked_thread_titles.join(' · ')}>
+        🔗 {t('关联合约/主线')}：{item.linked_thread_titles.join(' · ')}
+      </span>
+    </div>}
     {item.user_spark_quote && <blockquote className="spark-quote">
       <span>{t('你的原话 · WEARER SAID')}</span>“{item.user_spark_quote}”
     </blockquote>}
@@ -223,8 +333,8 @@ function SparkCard({ item, index }) {
         <b>∞ {t('极致延伸')}</b>
         <p>{item.extension}</p>
       </div>}
-      {item.relevance && <div className="spark-section">
-        <b>◎ {t('现实关联')}</b>
+      {item.relevance && <div className={`spark-section${item.linked_thread_titles?.length ? ' relevance-anchored' : ''}`}>
+        <b>◎ {t('现实关联 · 与真实主线的碰撞')}</b>
         <p>{item.relevance}</p>
       </div>}
     </div>}
@@ -374,6 +484,9 @@ export default function DevLabCenter() {
   const [recordings, setRecordings] = useState([])
   const [ambientLoading, setAmbientLoading] = useState(false)
   const [ambientError, setAmbientError] = useState('')
+  const [crystallized, setCrystallized] = useState(null)
+  const [crystallizedLoading, setCrystallizedLoading] = useState(false)
+  const [crystallizedError, setCrystallizedError] = useState('')
   const [busy, setBusy] = useState('')
   const [simulateError, setSimulateError] = useState('')
   const [insightEval, setInsightEval] = useState(null)
@@ -429,13 +542,30 @@ export default function DevLabCenter() {
     }
   }, [])
 
+  const loadCrystallized = useCallback(async signal => {
+    setCrystallizedLoading(true)
+    setCrystallizedError('')
+    try {
+      const payload = await readJson('/api/devlab/crystallized-context', {}, signal)
+      if (signal?.aborted) return
+      setCrystallized(payload.crystallized_context || payload)
+    } catch (error) {
+      if (error?.name !== 'AbortError') {
+        setCrystallizedError(error?.message || t('读取认知基底失败'))
+      }
+    } finally {
+      if (!signal?.aborted) setCrystallizedLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
     const controller = new AbortController()
     void loadInsights(controller.signal)
     void loadSparks(controller.signal)
     void loadAmbient(controller.signal)
+    void loadCrystallized(controller.signal)
     return () => controller.abort()
-  }, [loadInsights, loadSparks, loadAmbient])
+  }, [loadInsights, loadSparks, loadAmbient, loadCrystallized])
 
   useEffect(() => {
     if (activeTab !== 'ambient') return undefined
@@ -459,6 +589,7 @@ export default function DevLabCenter() {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(isPreset ? { mode: 'preset', preset } : { mode: 'real' }),
         })
+        if (payload.crystallizedContext) setCrystallized(payload.crystallizedContext)
         if (Array.isArray(payload.items)) setSparks(payload.items)
         if (payload.has_spark === false || payload.reason) {
           setSparkEval({
@@ -482,6 +613,7 @@ export default function DevLabCenter() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(isPreset ? { mode: 'preset', preset } : { mode: 'real' }),
       })
+      if (payload.crystallizedContext) setCrystallized(payload.crystallizedContext)
       if (Array.isArray(payload.items)) setInsights(payload.items)
       if (payload.success === false || payload.reason === 'insufficient_dialogue') {
         setInsightEval({
@@ -526,6 +658,13 @@ export default function DevLabCenter() {
         <span className="tab-text"><b>{t(tab.label)}</b><small>{tab.sub}</small></span>
       </button>)}
     </nav>
+
+    <CrystallizedAnchor
+      context={crystallized}
+      loading={crystallizedLoading}
+      error={crystallizedError}
+      onRefresh={() => void loadCrystallized()}
+    />
 
     {notice && <div className="devlab-toast" role="status">✦ {notice}</div>}
     {simulateError && activeTab !== 'events' && <div className="devlab-alert" role="alert">⚠ {simulateError}</div>}
