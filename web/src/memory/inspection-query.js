@@ -1,3 +1,5 @@
+import { canonicalMemorySection, memorySection } from '../../../shared/pwm-inspection-schema.mjs'
+
 function dayBoundary(value, nextDay = false) {
   if (!value) return ''
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) throw new RangeError('Invalid date')
@@ -12,16 +14,20 @@ function dayBoundary(value, nextDay = false) {
 }
 
 export function memoryListQuery({ section, page = 1, pageSize = 20,
-  type = '', scope = 'current', status = '', domain = '', role = '', fromDate = '', toDate = '',
+  type = '', scope = 'current', status = '', domain = '', role = '', fromDate = '', toDate = '', origin = '', subjectId = '',
 }) {
   const query = new URLSearchParams({ page: String(page), pageSize: String(pageSize) })
-  if (section === 'activities') {
+  const canonical = canonicalMemorySection(section)
+  const definition = memorySection(section)
+  if (!definition) throw new RangeError('Invalid memory section')
+  if (canonical === 'user_activity') {
     if (fromDate && toDate && fromDate > toDate) throw new RangeError('Invalid date range')
     query.set('role', role)
     query.set('from', dayBoundary(fromDate))
     query.set('to', dayBoundary(toDate, true))
   } else {
-    for (const [key, value] of Object.entries({ type, scope, status, domain })) query.set(key, value)
+    const values = { type, claimType: type, scope, status, domain, origin, subjectId }
+    for (const key of definition.filters) query.set(key, values[key] || '')
   }
   return query
 }

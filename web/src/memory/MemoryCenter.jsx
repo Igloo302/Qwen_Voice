@@ -2,10 +2,12 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { gatewayFetch } from '../gateway-transport.js'
 import { t } from '../i18n.js'
 import { memoryListQuery } from './inspection-query.js'
+import { memorySection } from '../../../shared/pwm-inspection-schema.mjs'
+import MemoryObjectDetail from './MemoryObjectDetail.jsx'
 import {
-  ACTIVITY_ROLES, SECTIONS, DOMAINS, STATUSES, INTENT_STATUS_KEYS, TYPES, activityRoleLabel, domainLabel, eventChanges, evidenceLabel,
+  ACTIVITY_ROLES, SECTIONS, DOMAINS, STATUSES, TYPES, activityRoleLabel, domainLabel, eventChanges, evidenceLabel,
   formatTime, inspectionError, operationLabel, recordFields, statusLabel,
-  titleFor, typeLabel, validityLabel, isActivity, observationWindow,
+  titleFor, typeLabel, validityLabel, isActivity, observationWindow, isClaim, isThread, isPattern,
 } from './presentation.js'
 import FeishuMeetingImport from './FeishuMeetingImport.jsx'
 import MemoryReset from './MemoryReset.jsx'
@@ -32,9 +34,11 @@ function Pager({ page, total, pageSize = PAGE_SIZE, onChange, disabled, label })
 }
 
 export function MemoryRecordDetail({ data, evidencePage = 1, historyPage = 1, sourcePage = 1,
-  setEvidencePage, setHistoryPage, setSourcePage, sourceExpanded, setSourceExpanded, busy }) {
+  setEvidencePage, setHistoryPage, setSourcePage, setDerivationPage, setPremisePagination, sourceExpanded, setSourceExpanded, busy }) {
   const item = data.item
   if (!item) return <p className="memory-empty">{t('这条记录已不存在，请刷新列表')}</p>
+  if (isClaim(item) || isThread(item) || isPattern(item)) return <MemoryObjectDetail data={data}
+    setEvidencePage={setEvidencePage} setHistoryPage={setHistoryPage} setDerivationPage={setDerivationPage} setPremisePagination={setPremisePagination} busy={busy} />
   const validity = validityLabel(item)
   const activity = isActivity(item)
   return <>
@@ -100,12 +104,14 @@ export function MemoryRecordDetail({ data, evidencePage = 1, historyPage = 1, so
 
 export default function MemoryCenter() {
   const [resetBlocked, setResetBlocked] = useState(false)
-  const [section, setSection] = useState('intents')
+  const [section, setSection] = useState('user_claims')
   const [type, setType] = useState('')
   const [scope, setScope] = useState('current')
   const [status, setStatus] = useState('')
   const [domain, setDomain] = useState('')
   const [role, setRole] = useState('')
+  const [origin, setOrigin] = useState('')
+  const [subjectId, setSubjectId] = useState('')
   const [fromDate, setFromDate] = useState('')
   const [toDate, setToDate] = useState('')
   const [page, setPage] = useState(1)
@@ -113,6 +119,8 @@ export default function MemoryCenter() {
   const [evidencePage, setEvidencePage] = useState(1)
   const [historyPage, setHistoryPage] = useState(1)
   const [sourcePage, setSourcePage] = useState(1)
+  const [derivationPage, setDerivationPage] = useState(1)
+  const [premisePagination, setPremisePagination] = useState({ id: null, page: 1 })
   const [sourceExpanded, setSourceExpanded] = useState(false)
   const [revision, setRevision] = useState(0)
   const [list, setList] = useState(null)
@@ -122,13 +130,14 @@ export default function MemoryCenter() {
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState('')
   const pending = useRef({ list: false, detail: false })
-  const activities = section === 'activities'
-  const listKey = `${section}:${type}:${scope}:${status}:${domain}:${role}:${fromDate}:${toDate}:${page}`
-  const detailKey = `${section}:${selected}:${evidencePage}:${historyPage}:${sourcePage}`
+  const activities = section === 'user_activity'
+  const definition = memorySection(section)
+  const listKey = `${section}:${type}:${scope}:${status}:${domain}:${role}:${fromDate}:${toDate}:${origin}:${subjectId}:${page}`
+  const detailKey = `${section}:${selected}:${evidencePage}:${historyPage}:${sourcePage}:${derivationPage}:${premisePagination.id}:${premisePagination.page}`
   const refresh = useCallback(() => setRevision(value => value + 1), [])
   const resetCompleted = useCallback(() => {
     setList(null); setDetail(null); setSelected(null); setPage(1)
-    setEvidencePage(1); setHistoryPage(1); setSourcePage(1)
+    setEvidencePage(1); setHistoryPage(1); setSourcePage(1); setDerivationPage(1)
     refresh()
   }, [refresh])
 
@@ -148,7 +157,7 @@ export default function MemoryCenter() {
     if (document.visibilityState === 'hidden') return undefined
     let query
     try {
-      query = memoryListQuery({ section, type, scope, status, domain, role, fromDate, toDate, page, pageSize: PAGE_SIZE })
+      query = memoryListQuery({ section, type, scope, status, domain, role, fromDate, toDate, origin, subjectId, page, pageSize: PAGE_SIZE })
     } catch {
       setListLoading(false)
       setListError(t('请选择有效的日期范围，开始日期不能晚于结束日期'))
@@ -172,12 +181,14 @@ export default function MemoryCenter() {
       if (!controller.signal.aborted) { requests.list = false; setListLoading(false) }
     })
     return () => { controller.abort(); requests.list = false }
-  }, [section, type, scope, status, domain, role, fromDate, toDate, page, listKey, revision])
+  }, [section, type, scope, status, domain, role, fromDate, toDate, origin, subjectId, page, listKey, revision])
 
   useEffect(() => {
     setEvidencePage(1)
     setHistoryPage(1)
     setSourcePage(1)
+    setDerivationPage(1)
+    setPremisePagination({ id: null, page: 1 })
     setSourceExpanded(false)
   }, [section, selected])
 
@@ -194,7 +205,14 @@ export default function MemoryCenter() {
     setDetailLoading(true)
     setDetailError('')
     const query = new URLSearchParams({ evidencePage: String(evidencePage), historyPage: String(historyPage) })
-    if (section === 'activities') query.set('sourcePage', String(sourcePage))
+    if (section === 'user_activity') query.set('sourcePage', String(sourcePage))
+    if (section === 'user_claims') {
+      query.set('derivationPage', String(derivationPage))
+      if (premisePagination.id) {
+        query.set('premiseDerivationId', String(premisePagination.id))
+        query.set('premisePage', String(premisePagination.page))
+      }
+    }
     void read(`api/pwm/${section}/${selected}?${query}`, controller.signal).then(data => {
       if (!controller.signal.aborted) setDetail({ key: detailKey, data })
     }).catch(error => {
@@ -203,7 +221,7 @@ export default function MemoryCenter() {
       if (!controller.signal.aborted) { requests.detail = false; setDetailLoading(false) }
     })
     return () => { controller.abort(); requests.detail = false }
-  }, [section, selected, evidencePage, historyPage, sourcePage, detailKey, revision])
+  }, [section, selected, evidencePage, historyPage, sourcePage, derivationPage, premisePagination, detailKey, revision])
 
   const data = list?.key === listKey ? list.data : null
   const detailData = detail?.key === detailKey ? detail.data : null
@@ -212,7 +230,7 @@ export default function MemoryCenter() {
   const changeSection = next => {
     if (next === section) return
     setSection(next); setType(''); setStatus(''); setDomain(''); setScope('current')
-    setRole(''); setFromDate(''); setToDate(''); setPage(1); setSelected(null)
+    setRole(''); setOrigin(''); setSubjectId(''); setFromDate(''); setToDate(''); setPage(1); setSelected(null)
     setList(null); setDetail(null)
   }
 
@@ -231,7 +249,7 @@ export default function MemoryCenter() {
       </nav>
       <section className="memory-content" aria-label={t(SECTIONS[section])}>
         <div className="memory-toolbar">
-          {!activities && <div className="memory-type-tabs" role="group" aria-label={t('记录类型')}>
+          {!!definition.types.length && <div className="memory-type-tabs" role="group" aria-label={t('记录类型')}>
             <button type="button" aria-pressed={!type} onClick={() => resetFilter(setType, '')}>{t('全部类型')}</button>
             {Object.entries(TYPES[section]).map(([key, label]) => <button type="button" key={key}
               aria-pressed={type === key} onClick={() => resetFilter(setType, key)}>{t(label)}</button>)}
@@ -247,19 +265,22 @@ export default function MemoryCenter() {
               <label>{t('结束日期')}<input aria-label={t('结束日期')} type="date" value={toDate}
                 onInput={event => resetFilter(setToDate, event.currentTarget.value)} /></label>
             </> : <>
-            <label>{t('显示范围')}<select aria-label={t('显示范围')} value={scope} onChange={event => resetFilter(setScope, event.target.value)}>
+            {definition.filters.includes('scope') && <label>{t('显示范围')}<select aria-label={t('显示范围')} value={scope} onChange={event => resetFilter(setScope, event.target.value)}>
               <option value="current">{t('当前记录')}</option><option value="history">{t('历史记录')}</option><option value="all">{t('全部记录')}</option>
-            </select></label>
-            <label>{t('状态')}<select aria-label={t('状态')} value={status} onChange={event => resetFilter(setStatus, event.target.value)}>
+            </select></label>}
+            {!!definition.statuses.length && <label>{t('状态')}<select aria-label={t('状态')} value={status} onChange={event => resetFilter(setStatus, event.target.value)}>
               <option value="">{t('全部状态')}</option>
-              {Object.entries(STATUSES).filter(([key]) => section === 'states'
-                ? ['active', 'weakened', 'expired'].includes(key) : INTENT_STATUS_KEYS.includes(key))
-                .map(([key, label]) => <option value={key} key={key}>{t(label)}</option>)}
-            </select></label>
-            <label>{t('领域')}<select aria-label={t('领域')} value={domain} onChange={event => resetFilter(setDomain, event.target.value)}>
+              {definition.statuses.map(key => <option value={key} key={key}>{t(STATUSES[key] || key)}</option>)}
+            </select></label>}
+            {definition.filters.includes('origin') && <label>claim_origin<select aria-label="claim_origin" value={origin} onChange={event => resetFilter(setOrigin, event.target.value)}>
+              <option value="">all</option><option value="explicit">explicit</option><option value="derived">derived</option>
+            </select></label>}
+            {definition.filters.includes('subjectId') && <label>subject_entity_id<input aria-label="subject_entity_id" inputMode="numeric" maxLength={16} value={subjectId}
+              onChange={event => resetFilter(setSubjectId, event.target.value)} /></label>}
+            {definition.filters.includes('domain') && <label>{t('领域')}<select aria-label={t('领域')} value={domain} onChange={event => resetFilter(setDomain, event.target.value)}>
               <option value="">{t('全部领域')}</option>
               {Object.entries(DOMAINS).map(([key, label]) => <option value={key} key={key}>{t(label)}</option>)}
-            </select></label>
+            </select></label>}
             </>}
           </div>
         </div>
@@ -274,8 +295,10 @@ export default function MemoryCenter() {
               {!listLoading && !listError && data?.available && !items.length && <p className="memory-empty">{t('没有符合筛选条件的记录')}</p>}
               {items.map(item => <button type="button" className="memory-list-item" aria-pressed={selected === item.id}
                 key={item.id} onClick={() => setSelected(item.id)}>
-                <span className="memory-record-meta">{typeLabel(item)} · {isActivity(item) ? activityRoleLabel(item.user_role) : statusLabel(item)}</span>
+                <span className="memory-record-meta">{typeLabel(item)}{isActivity(item) ? ` · ${activityRoleLabel(item.user_role)}` : item.status ? ` · ${statusLabel(item)}` : ''}</span>
                 <strong>{titleFor(item)}</strong>
+                {(isClaim(item) || isPattern(item)) && <span>{item.subject_name}{item.claim_origin ? ` · ${item.claim_origin}` : ''}</span>}
+                {isThread(item) && <span>{item.current_summary?.slice(0, 140)}</span>}
                 <span>{isActivity(item) ? observationWindow(item)
                   : <>{domainLabel(item.primary_domain || item.state_domain)} · {formatTime(item.time_end || item.last_observed_at || item.updated_at, item.time_end ? item.details?.time_precision : '')}</>}</span>
                 {validityLabel(item) && <span className="memory-validity">{validityLabel(item)}</span>}
@@ -287,7 +310,7 @@ export default function MemoryCenter() {
             {detailError && <p className="memory-error" role="alert">{detailError}</p>}
             {detailData && !detailError ? <MemoryRecordDetail data={detailData} busy={detailLoading}
               evidencePage={evidencePage} historyPage={historyPage} sourcePage={sourcePage}
-              setEvidencePage={setEvidencePage} setHistoryPage={setHistoryPage} setSourcePage={setSourcePage}
+              setEvidencePage={setEvidencePage} setHistoryPage={setHistoryPage} setSourcePage={setSourcePage} setDerivationPage={setDerivationPage} setPremisePagination={setPremisePagination}
               sourceExpanded={sourceExpanded} setSourceExpanded={setSourceExpanded} />
               : !detailError && <p className="memory-empty">{t(selected ? '正在读取详情…' : '选择一条记录查看内容、依据和变更')}</p>}
           </div>

@@ -68,3 +68,18 @@ test('activity date filters cover whole local days and never send stale state fi
   assert.throws(() => memoryListQuery({ section: 'activities', fromDate: '2026-02-30' }), RangeError)
   assert.throws(() => memoryListQuery({ section: 'activities', fromDate: '2026-11-04', toDate: '2026-11-03' }), RangeError)
 })
+
+
+test('new categories never forward stale filters into incompatible queries', () => {
+  const claims = memoryListQuery({ section: 'user_claims', type: 'preference', origin: 'derived', subjectId: '1', scope: 'current' })
+  assert.equal(claims.get('claimType'), 'preference')
+  assert.equal(claims.get('origin'), 'derived')
+  assert.equal(claims.has('scope'), false)
+  const pattern = memoryListQuery({ section: 'user_observed_pattern', status: 'active', scope: 'current', role: 'actor', domain: 'work' })
+  assert.equal(pattern.get('domain'), 'work')
+  for (const key of ['status', 'scope', 'role', 'type']) assert.equal(pattern.has(key), false)
+  const thread = memoryListQuery({ section: 'user_thread', domain: 'work', status: 'closed' })
+  assert.equal(thread.get('status'), 'closed')
+  assert.equal(thread.has('domain'), false)
+  assert.ok(recordFields({ object_type: 'plan', current_progress: '材料已确认' }).some(field => field.value === '材料已确认'))
+})

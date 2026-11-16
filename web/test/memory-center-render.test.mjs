@@ -27,9 +27,15 @@ test('memory center renders independently without browser voice globals', () => 
   const html = renderToStaticMarkup(createElement(MemoryCenter))
   assert.match(html, /我的记忆/)
   assert.match(html, /查看记忆不会激活语音/)
-  assert.match(html, /意图与安排/)
-  assert.match(html, /我的状态/)
-  assert.match(html, /我的活动/)
+  const sections = ['user_claims', 'user_intents', 'user_activity', 'user_thread', 'user_observed_pattern', 'user_states']
+  let previous = -1
+  for (const section of sections) {
+    const position = html.indexOf(`>${section}</button>`)
+    assert.ok(position > previous, section)
+    previous = position
+  }
+  assert.match(html, /claim_origin/)
+  assert.match(html, /subject_entity_id/)
   assert.doesNotMatch(html, /开启麦克风/)
 })
 
@@ -66,4 +72,35 @@ test('details escape extracted content and distinguish missing evidence from ori
   assert.match(html, /来源记录已不可用/)
   assert.match(html, /原始话语/)
   assert.match(html, /旧状态 → 新状态/)
+})
+
+
+test('claim derivations retain invalidation and missing premise evidence without rendering injected markup', () => {
+  const html = renderToStaticMarkup(createElement(MemoryRecordDetail, { data: {
+    item: { id: 1, claim_text: '<script>claim</script>', claim_origin: 'derived', claim_type: 'constraint', status: 'candidate' },
+    derivations: { total: 1, items: [{ id: 1, rule_id: 'entailment', status: 'invalidated', invalidated_at: '2026-11-16',
+      premises: { total: 1, items: [{ evidence_type: 'user_claim', evidence_id: 99, resolved: false }] } }] },
+  } }))
+  for (const text of ['derivations', 'invalidated', 'premises', '来源记录已不可用', '&lt;script&gt;']) assert.ok(html.includes(text), text)
+  assert.doesNotMatch(html, /<script>/)
+})
+
+test('thread timeline exposes event time and knowledge time without inventing confidence', () => {
+  const html = renderToStaticMarkup(createElement(MemoryRecordDetail, { data: {
+    item: { id: 2, title: '项目演示', identity_description: '项目', current_summary: '进行中', status: 'active' },
+    history: { total: 1, items: [{ id: 1, event_type: 'progress', summary: '准备材料',
+      occurred_at: '2026-11-15T10:00:00+08:00', known_at: '2026-11-16T10:00:00+08:00' }] },
+  } }))
+  for (const text of ['event timeline', 'occurred_at', 'known_at', '准备材料', 'current_summary']) assert.ok(html.includes(text), text)
+  assert.doesNotMatch(html, /confidence|提炼置信度/)
+})
+
+test('observed pattern shows supporting action and originating activity with raw excerpts', () => {
+  const html = renderToStaticMarkup(createElement(MemoryRecordDetail, { data: {
+    item: { id: 3, pattern_text: '习惯提前准备', condition_text: '演示前', confidence: .8 },
+    evidence: { total: 1, items: [{ evidence_type: 'user_action_signal', evidence_id: 1, resolved: true, text: '检查材料',
+      source: { evidence_type: 'user_activity', evidence_id: 2, resolved: true, text: '准备演示' },
+      source_segments: [{ id: 1, text: '提前检查一下', started_at: '2026-11-16' }] }] },
+  } }))
+  for (const text of ['supporting signals', '检查材料', '准备演示', '提前检查一下', 'condition_text']) assert.ok(html.includes(text), text)
 })

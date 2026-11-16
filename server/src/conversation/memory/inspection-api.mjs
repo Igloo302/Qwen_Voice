@@ -1,13 +1,4 @@
-// Structured inspection is separate from the synchronous Realtime documents.
-const TYPES = {
-  intents: ['goal', 'plan', 'work_item'],
-  states: ['situational_state', 'recurring_state', 'enduring_state'],
-  activities: [],
-}
-const STATUSES = new Set([
-  'active', 'planned', 'rescheduled', 'open', 'in_progress', 'blocked',
-  'completed', 'cancelled', 'occurred', 'weakened', 'expired',
-])
+import { canonicalMemorySection, memorySection } from '../../../../shared/pwm-inspection-schema.mjs'
 
 function positive(value, fallback, maximum) {
   if (value === undefined) return fallback
@@ -28,20 +19,27 @@ function instant(value) {
 }
 
 export function memoryInspectionOptions(section, id, query = {}) {
-  if (!Object.hasOwn(TYPES, section)) return null
+  const definition = memorySection(section)
+  if (!definition) return null
+  const canonical = canonicalMemorySection(section)
   const options = { section }
   for (const [key, fallback, maximum] of [
     ['page', 1, 1_000_000], ['pageSize', 20, 100],
     ['evidencePage', 1, 1_000_000], ['historyPage', 1, 1_000_000],
+    ['sourcePage', 1, 1_000_000], ['derivationPage', 1, 1_000_000], ['premisePage', 1, 1_000_000],
   ]) {
     options[key] = positive(query[key], fallback, maximum)
     if (options[key] === null) return null
+  }
+  if (query.premiseDerivationId !== undefined) {
+    options.premiseDerivationId = positive(query.premiseDerivationId, null, Number.MAX_SAFE_INTEGER)
+    if (options.premiseDerivationId === null) return null
   }
   if (id !== undefined) {
     options.id = positive(id, null, Number.MAX_SAFE_INTEGER)
     if (options.id === null) return null
   }
-  if (section === 'activities') {
+  if (canonical === 'user_activity') {
     if (query.role !== undefined && typeof query.role !== 'string') return null
     options.role = query.role || ''
     if (options.role && !['actor', 'participant', 'contextual'].includes(options.role)) return null
@@ -52,15 +50,26 @@ export function memoryInspectionOptions(section, id, query = {}) {
     if (options.from && options.to && Date.parse(options.from) >= Date.parse(options.to)) return null
     return options
   }
-  for (const key of ['type', 'scope', 'status', 'domain']) {
+  for (const key of definition.filters) {
+    if (key === 'subjectId') {
+      if (query[key] !== undefined && query[key] !== '') {
+        options[key] = positive(query[key], null, Number.MAX_SAFE_INTEGER)
+        if (options[key] === null) return null
+      }
+      continue
+    }
     if (query[key] !== undefined && typeof query[key] !== 'string') return null
     options[key] = query[key] || ''
+    if (options[key].length > 80) return null
   }
-  options.scope ||= 'current'
-  if (options.type && !TYPES[section].includes(options.type)) return null
-  if (!['current', 'history', 'all'].includes(options.scope)) return null
-  if (options.status && !STATUSES.has(options.status)) return null
-  if (options.domain.length > 80) return null
+  if (definition.filters.includes('scope')) {
+    options.scope ||= 'current'
+    if (!['current', 'history', 'all'].includes(options.scope)) return null
+  }
+  if (options.type && !definition.types.includes(options.type)) return null
+  if (options.claimType && !definition.types.includes(options.claimType)) return null
+  if (options.status && !definition.statuses.includes(options.status)) return null
+  if (options.origin && !['explicit', 'derived'].includes(options.origin)) return null
   // ownerId and database paths are deliberately never accepted from a client.
   return options
 }

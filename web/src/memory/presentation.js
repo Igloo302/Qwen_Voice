@@ -1,12 +1,17 @@
 import { t } from '../i18n.js'
+import { MEMORY_SECTIONS } from '../../../shared/pwm-inspection-schema.mjs'
 
-export const SECTIONS = { activities: '我的活动', intents: '意图与安排', states: '我的状态' }
+export const SECTIONS = Object.fromEntries(Object.keys(MEMORY_SECTIONS).map(key => [key, key]))
 export const ACTIVITY_ROLES = { actor: '亲自行动', participant: '参与活动或交流', contextual: '情境接触' }
 
 export const TYPES = {
   intents: { goal: '目标', plan: '计划', work_item: '待办' },
   states: { situational_state: '当前状态', recurring_state: '规律习惯', enduring_state: '长期特征' },
 }
+TYPES.user_intents = TYPES.intents
+TYPES.user_states = TYPES.states
+TYPES.user_claims = Object.fromEntries(MEMORY_SECTIONS.user_claims.types.map(key => [key, key]))
+
 export const DOMAINS = {
   general: '通用', work: '工作', life: '生活', health: '健康', family: '家庭',
   learning: '学习', social: '社交', interest: '兴趣', travel: '出行',
@@ -14,12 +19,16 @@ export const DOMAINS = {
 }
 export const INTENT_STATUS_KEYS = ['pending', 'in_progress', 'blocked', 'completed', 'cancelled']
 export const STATUSES = {
-  pending: '待处理',
+  pending: '待处理', candidate: 'candidate', superseded: 'superseded', retracted: 'retracted', closed: 'closed',
   active: '有效', planned: '已计划', rescheduled: '已改期', open: '待处理',
   in_progress: '进行中', blocked: '受阻', completed: '已完成', cancelled: '已取消',
   occurred: '已发生', weakened: '依据减弱', expired: '已失效',
 }
 const FIELDS = {
+  claim_type: 'claim_type', claim_origin: 'claim_origin', subject_name: 'subject',
+  predicate: 'predicate', object_name: 'object', source_actor_name: 'source_actor',
+  identity_description: 'identity_description', current_summary: 'current_summary',
+  condition_text: 'condition_text', current_progress: '当前进展',
   summary: '内容', state_text: '状态描述', status: '状态', time_start: '开始时间',
   time_end: '结束或截止时间', start_at: '开始时间', end_at: '结束时间',
   due_at: '截止时间', target_at: '目标时间', valid_from: '生效时间', valid_to: '有效期至',
@@ -27,7 +36,7 @@ const FIELDS = {
   time_precision: '时间精度', location_text: '地点', action_text: '具体行动',
   deliverable: '交付物', responsibility_type: '责任类型', priority: '优先级',
   completed_at: '完成时间', conditions: '适用条件', confidence: '提炼置信度',
-  participants: '参与者', details: '补充信息', condition_text: '适用条件',
+  participants: '参与者', details: '补充信息',
 }
 const VALUES = {
   personal_action: '个人行动', commitment: '承诺', assigned: '受指派',
@@ -45,7 +54,14 @@ const OPERATIONS = {
   reinforce: '强化', weaken: '减弱', expire: '失效',
 }
 
+export function isClaim(item) { return typeof item.claim_text === 'string' }
+export function isThread(item) { return typeof item.current_summary === 'string' }
+export function isPattern(item) { return typeof item.pattern_text === 'string' }
+
 export function typeLabel(item) {
+  if (isClaim(item)) return 'user_claims'
+  if (isThread(item)) return 'user_thread'
+  if (isPattern(item)) return 'user_observed_pattern'
   if (isActivity(item)) return t('用户活动')
   return t(TYPES.intents[item.object_type] || TYPES.states[item.state_type] || '未分类')
 }
@@ -54,7 +70,7 @@ export function statusLabel(item) {
   if (item.object_type === 'goal' && item.status === 'active') return t('推进中')
   return t(STATUSES[item.status] || item.status || '未明确')
 }
-export function titleFor(item) { return item.activity_text || item.summary || item.state_text || item.state_topic || t('无标题') }
+export function titleFor(item) { return item.claim_text || item.title || item.pattern_text || item.activity_text || item.summary || item.state_text || item.state_topic || t('无标题') }
 export function isActivity(item) { return typeof item.activity_text === 'string' }
 export function activityRoleLabel(role) { return t(ACTIVITY_ROLES[role] || '未明确') }
 export function observationWindow(item) {
@@ -63,7 +79,7 @@ export function observationWindow(item) {
 }
 export function fieldLabel(key) { return t(FIELDS[key] || key) }
 export function evidenceLabel(kind) { return t(EVIDENCE[kind] || kind) }
-export function operationLabel(event) { return t(OPERATIONS[event.operation || event.event_type] || '更新') }
+export function operationLabel(event) { return t(OPERATIONS[event.operation || event.event_type] || event.operation || event.event_type || '更新') }
 
 export function formatTime(value, precision = '') {
   if (!value) return t('未明确')
@@ -102,8 +118,14 @@ export function recordFields(item) {
     { key: 'user_role', label: t('参与角色'), value: activityRoleLabel(item.user_role) },
     { key: 'observation_window', label: t('观察时间窗口'), value: observationWindow(item) },
   ]
-  const fields = item.object_type
-    ? [['status', statusLabel(item)], ['time_start', item.time_start], ['time_end', item.time_end],
+  const fields = isClaim(item)
+    ? [['claim_type', item.claim_type], ['claim_origin', item.claim_origin], ['subject_name', item.subject_name],
+        ['predicate', item.predicate], ['object_name', item.object_name], ['source_actor_name', item.source_actor_name],
+        ['status', statusLabel(item)], ['valid_from', item.valid_from], ['valid_to', item.valid_to]]
+    : isThread(item) ? [['identity_description', item.identity_description], ['current_summary', item.current_summary], ['status', statusLabel(item)]]
+    : isPattern(item) ? [['subject_name', item.subject_name], ['condition_text', item.condition_text]]
+    : item.object_type
+    ? [['status', statusLabel(item)], ['current_progress', item.current_progress], ['time_start', item.time_start], ['time_end', item.time_end],
         ...Object.entries(item.details || {}).filter(([key]) => Object.hasOwn(FIELDS, key)
           && !(['target_at', 'due_at', 'end_at'].includes(key) && item.time_end)
           && !(key === 'start_at' && item.time_start))]
