@@ -19,11 +19,35 @@ const DEFAULT_INSIGHTS_PATH = join(
 const DEFAULT_SPARK_PATH = join(
   homedir(), '.config/qwaudio/data/memory/spark_captures.jsonl',
 )
+// Real ambient transcripts may live in either location depending on the app
+// version. The agent-memory path is the current one; the plain memory path is
+// kept as a tolerance fallback for older installations.
+const PRIMARY_RECORDINGS_DIR = join(
+  homedir(), '.config/qwaudio/data/memory/agent-memory/ambient-recordings',
+)
 const DEFAULT_RECORDINGS_DIR = join(
   homedir(), '.config/qwaudio/data/memory/ambient-recordings',
 )
+const RECORDINGS_DIR_CANDIDATES = Object.freeze([
+  PRIMARY_RECORDINGS_DIR,
+  DEFAULT_RECORDINGS_DIR,
+])
 const DEFAULT_INSIGHT_LIMIT = 50
 const DEFAULT_SIMULATE_TIMEOUT_MS = 180_000
+
+// Minimum evidence required before a real recording is allowed to "become" a
+// field. A single monosyllable ("嗯") or a lone turn is never enough to form an
+// interpersonal game worth interpreting.
+const MIN_REAL_DIALOGUE_CHARS = 30
+const MIN_REAL_DIALOGUE_TURNS = 2
+const MAX_REAL_DIALOGUE_FILES = 5
+
+// Mirror of the Python services' owner label set: speaker_0 / user / 本人 are
+// the wearer, everyone else folds into speaker_1 (external field voices).
+const OWNER_SPEAKER_LABELS = new Set([
+  'speaker_0', 'user', 'human', 'self', 'me', 'i', 'wearer', 'owner',
+  '用户', '用户本人', '佩戴者', '本人', '我', 'speaker_用户本人',
+])
 
 // Scene presets mirror the three cards in the DevLab event simulator tab.
 // speaker_0 is always the wearer, speaker_1 an external voice in the field.
@@ -120,6 +144,11 @@ function resolveSparkPreset(value) {
   return SPARK_PRESET_ALIASES[key] || ''
 }
 
+function normalizeSpeakerLabel(value) {
+  const raw = clean(value, 64).trim().toLowerCase()
+  return OWNER_SPEAKER_LABELS.has(raw) ? 'speaker_0' : 'speaker_1'
+}
+
 function normalizeTurns(value, maxChars = 4_000) {
   if (!Array.isArray(value)) return []
   const turns = []
@@ -127,15 +156,104 @@ function normalizeTurns(value, maxChars = 4_000) {
     if (!candidate || typeof candidate !== 'object') continue
     const text = clean(candidate.text ?? candidate.content ?? candidate.quote, maxChars)
     if (!text) continue
-    const raw = clean(
-      candidate.speaker ?? candidate.speaker_id ?? candidate.speakerId, 64,
-    ).toLowerCase()
     turns.push({
-      speaker: raw === 'speaker_0' || raw === 'user' ? 'speaker_0' : 'speaker_1',
+      speaker: normalizeSpeakerLabel(
+        candidate.speaker ?? candidate.speaker_id ?? candidate.speakerId,
+      ),
       text,
     })
   }
   return turns
+}
+
+// Strip punctuation / symbols / whitespace. "嗯。" leaves a single character
+// and is discarded; "嗯嗯，我不准确" keeps its meaningful content.
+function meaningfulChars(text) {
+  return [...String(text ?? '').replace(/[\s\p{P}\p{S}]/gu, '')]
+}
+
+function isMeaningfulSegment(text) {
+  const chars = meaningfulChars(text)
+  if (chars.length < 2) return false
+  // Pure interjections ("嗯嗯", "啊啊", "呃呃") carry no information either.
+  if (/^[嗯啊呃哦诶唉额唔嘿]+$/u.test(chars.join(''))) return false
+  return true
+}
+
+export function resolveMode(value) {
+  return clean(value, 16).toLowerCase() === 'preset' ? 'preset' : 'real'
+}
+
+export function resolveRecordingsDir(explicit, candidates = RECORDINGS_DIR_CANDIDATES) {
+  if (explicit) return explicit
+  return candidates.find(dir => dir && existsSync(dir)) || candidates[0] || PRIMARY_RECORDINGS_DIR
+}
+
+function buildRealSource(fileNames = []) {
+  return ['devlab:real', ...fileNames.map(name => clean(name, 200))].join('|')
+}
+
+function realSourceFiles(source) {
+  const text = String(source ?? '')
+  if (!text.startsWith('devlab:real')) return []
+  return text.split('|').slice(1).filter(Boolean).map(name => clean(name, 200))
+}
+
+function markRealItems(items, source, fileNames) {
+  return items.map(item => (item.source === source
+    ? { ...item, is_real_data: true, source_files: fileNames }
+    : item))
+}
+
+// Core of the "real data driven" upgrade: scan the newest ASR transcripts in
+// reverse chronological order, drop noise-only segments and fold every speaker
+// into wearer (speaker_0) vs external (speaker_1).
+export function extractRecentRealDialogue(recordingsDir, options = {}) {
+  const dir = resolveRecordingsDir(recordingsDir)
+  const empty = { turns: [], fileNames: [], totalChars: 0, totalTurns: 0, rawSegments: [] }
+  if (!dir || !existsSync(dir)) return empty
+  const maxFiles = boundedInteger(options.maxFiles, MAX_REAL_DIALOGUE_FILES, 20)
+  let files
+  try {
+    files = readdirSync(dir, { withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name.endsWith('.asr.json'))
+      .map(entry => {
+        const path = join(dir, entry.name)
+        let modifiedAt = 0
+        try { modifiedAt = statSync(path).mtimeMs } catch {}
+        return { path, name: entry.name, modifiedAt }
+      })
+      .sort((left, right) => right.modifiedAt - left.modifiedAt)
+      .slice(0, maxFiles)
+  } catch {
+    return empty
+  }
+
+  const turns = []
+  const fileNames = []
+  const rawSegments = []
+  for (const file of files) {
+    let parsed
+    try {
+      parsed = JSON.parse(readFileSync(file.path, 'utf8'))
+    } catch {
+      // A single corrupt transcript must not hide the other real recordings.
+      continue
+    }
+    fileNames.push(file.name)
+    const segments = (Array.isArray(parsed.segments) ? parsed.segments : [])
+      .map(normalizeSegment)
+      .filter(Boolean)
+      .slice(0, 300)
+      .map(segment => ({ ...segment, file: file.name }))
+    rawSegments.push(...segments)
+    for (const segment of segments) {
+      if (!isMeaningfulSegment(segment.text)) continue
+      turns.push({ speaker: normalizeSpeakerLabel(segment.speaker), text: segment.text })
+    }
+  }
+  const totalChars = turns.reduce((sum, turn) => sum + [...turn.text].length, 0)
+  return { turns, fileNames, totalChars, totalTurns: turns.length, rawSegments }
 }
 
 function normalizeInsight(record) {
@@ -148,8 +266,12 @@ function normalizeInsight(record) {
     recommended_action: clean(record.recommended_action, 400),
     created_at: clean(record.created_at, 60),
     model: clean(record.model, 120),
-    source: clean(record.source, 80),
+    source: clean(record.source, 1_000),
     provider: clean(record.provider, 80),
+    is_real_data: record.is_real_data === true || realSourceFiles(record.source).length > 0,
+    source_files: Array.isArray(record.source_files)
+      ? record.source_files.map(name => clean(name, 200))
+      : realSourceFiles(record.source),
   }
   const turnCount = Number(record.turn_count)
   insight.turn_count = Number.isSafeInteger(turnCount) && turnCount >= 0 ? turnCount : null
@@ -188,8 +310,12 @@ function normalizeSpark(record) {
     reality_check: clean(record.reality_check, 1_000),
     created_at: clean(record.created_at, 60),
     model: clean(record.model, 120),
-    source: clean(record.source, 80),
+    source: clean(record.source, 1_000),
     provider: clean(record.provider, 80),
+    is_real_data: record.is_real_data === true || realSourceFiles(record.source).length > 0,
+    source_files: Array.isArray(record.source_files)
+      ? record.source_files.map(name => clean(name, 200))
+      : realSourceFiles(record.source),
   }
   const turnCount = Number(record.turn_count)
   spark.turn_count = Number.isSafeInteger(turnCount) && turnCount >= 0 ? turnCount : null
@@ -265,7 +391,7 @@ function normalizeSegment(segment) {
   }
 }
 
-export function readAmbientRecordings(recordingsDir = DEFAULT_RECORDINGS_DIR, limit = 3) {
+export function readAmbientRecordings(recordingsDir = resolveRecordingsDir(), limit = 3) {
   if (!recordingsDir || !existsSync(recordingsDir)) return []
   let files
   try {
@@ -466,7 +592,7 @@ export function createSparkPythonSimulator(options = {}) {
 export function registerDevLabRoutes(app, options = {}) {
   const insightsPath = options.insightsPath || DEFAULT_INSIGHTS_PATH
   const sparksPath = options.sparksPath || DEFAULT_SPARK_PATH
-  const recordingsDir = options.recordingsDir || DEFAULT_RECORDINGS_DIR
+  const recordingsDir = resolveRecordingsDir(options.recordingsDir)
   const insightLimit = boundedInteger(options.insightLimit, DEFAULT_INSIGHT_LIMIT, 200)
   const simulate = typeof options.simulate === 'function'
     ? options.simulate
@@ -488,6 +614,51 @@ export function registerDevLabRoutes(app, options = {}) {
   app.post('/api/devlab/insights/simulate', async (req, res) => {
     res.setHeader('cache-control', 'no-store')
     const body = req.body && typeof req.body === 'object' ? req.body : {}
+
+    // Real-data mode is the default. Presets are opt-in via mode="preset".
+    if (resolveMode(body.mode) === 'real') {
+      const real = extractRecentRealDialogue(recordingsDir)
+      const stats = {
+        filesScanned: real.fileNames.length,
+        totalChars: real.totalChars,
+        totalTurns: real.totalTurns,
+      }
+      if (
+        real.totalChars < MIN_REAL_DIALOGUE_CHARS
+        || real.totalTurns < MIN_REAL_DIALOGUE_TURNS
+      ) {
+        return res.json({
+          success: false,
+          evaluated: true,
+          reason: 'insufficient_dialogue',
+          message: '最近真实录音有效字数不足 30 字（仅检测到零星应答），未能凝聚出有效的人际博弈场域，规则判定不生成洞察。',
+          sourceFiles: real.fileNames,
+          stats,
+        })
+      }
+      const source = buildRealSource(real.fileNames)
+      try {
+        const raw = await simulate({
+          segments: real.turns,
+          messages: [],
+          source,
+          preset: '',
+        })
+        if (!raw) return res.status(502).json({ code: 'devlab_simulation_empty' })
+        const insight = { ...raw, is_real_data: true, source_files: real.fileNames }
+        let items = []
+        try { items = readInsights(insightsPath, insightLimit) } catch {}
+        return res.json({ success: true, insight, items: markRealItems(items, source, real.fileNames) })
+      } catch {
+        // Never leak raw stderr (paths / credentials) to the UI.
+        return res.status(503).json({
+          code: 'devlab_simulation_unavailable',
+          error: '模拟生成失败，请检查 Python side-car 与模型配置后重试',
+        })
+      }
+    }
+
+    // Legacy preset mode — kept for the event simulator tab / full coverage.
     const preset = resolvePreset(body.preset)
     if (body.preset !== undefined && body.preset !== null && body.preset !== '' && !preset) {
       return res.status(400).json({ code: 'invalid_devlab_preset' })
@@ -497,12 +668,7 @@ export function registerDevLabRoutes(app, options = {}) {
     if (!turns.length) turns = preset ? [...DEVLAB_PRESETS[preset]] : [...DEVLAB_PRESETS.dispute_compromise]
     const source = preset ? `devlab:${preset}` : 'devlab:custom'
     try {
-      const insight = await simulate({
-        segments: turns,
-        messages: [],
-        source,
-        preset,
-      })
+      const insight = await simulate({ segments: turns, messages: [], source, preset })
       if (!insight) {
         return res.status(502).json({ code: 'devlab_simulation_empty' })
       }
@@ -533,6 +699,59 @@ export function registerDevLabRoutes(app, options = {}) {
   app.post('/api/devlab/sparks/simulate', async (req, res) => {
     res.setHeader('cache-control', 'no-store')
     const body = req.body && typeof req.body === 'object' ? req.body : {}
+
+    // Real-data mode is the default. Presets are opt-in via mode="preset".
+    if (resolveMode(body.mode) === 'real') {
+      const real = extractRecentRealDialogue(recordingsDir)
+      const stats = {
+        filesScanned: real.fileNames.length,
+        totalChars: real.totalChars,
+        totalTurns: real.totalTurns,
+      }
+      if (real.turns.length === 0) {
+        return res.json({
+          success: false,
+          evaluated: true,
+          reason: 'no_voice',
+          message: '最近没有可用的真实语音转录，暂无法扫描灵感。请先在环境音轨中捕获一段真实对白。',
+          sourceFiles: real.fileNames,
+          stats,
+        })
+      }
+      const source = buildRealSource(real.fileNames)
+      try {
+        const raw = await sparkSimulate({
+          segments: real.turns,
+          messages: [],
+          source,
+          preset: '',
+        })
+        if (!raw) return res.status(502).json({ code: 'devlab_simulation_empty' })
+        // The model judged this to be ordinary business chatter: report the
+        // rule outcome transparently and never fabricate a spicy card.
+        if (raw.has_spark !== true) {
+          return res.json({
+            success: true,
+            evaluated: true,
+            has_spark: false,
+            message: `已分析最近真实对白（包含 ${real.totalTurns} 轮讨论），佩戴者未提出新颖创意或假设，规则判定无灵感火花。`,
+            sourceFiles: real.fileNames,
+            stats,
+          })
+        }
+        const spark = { ...raw, is_real_data: true, source_files: real.fileNames }
+        let items = []
+        try { items = readSparks(sparksPath, insightLimit) } catch {}
+        return res.json({ success: true, spark, items: markRealItems(items, source, real.fileNames) })
+      } catch {
+        return res.status(503).json({
+          code: 'devlab_simulation_unavailable',
+          error: '模拟生成失败，请检查 Python side-car 与模型配置后重试',
+        })
+      }
+    }
+
+    // Legacy preset mode — kept for the event simulator tab / full coverage.
     const preset = resolveSparkPreset(body.preset)
     if (body.preset !== undefined && body.preset !== null && body.preset !== '' && !preset) {
       return res.status(400).json({ code: 'invalid_devlab_preset' })
@@ -542,12 +761,7 @@ export function registerDevLabRoutes(app, options = {}) {
     if (!turns.length) turns = preset ? [...SPARK_PRESETS[preset]] : [...SPARK_PRESETS.roast_glasses]
     const source = preset ? `devlab:spark:${preset}` : 'devlab:spark:custom'
     try {
-      const spark = await sparkSimulate({
-        segments: turns,
-        messages: [],
-        source,
-        preset,
-      })
+      const spark = await sparkSimulate({ segments: turns, messages: [], source, preset })
       if (!spark) {
         return res.status(502).json({ code: 'devlab_simulation_empty' })
       }

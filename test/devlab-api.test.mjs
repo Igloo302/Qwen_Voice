@@ -8,10 +8,13 @@ import test from 'node:test'
 import {
   DEVLAB_PRESETS,
   SPARK_PRESETS,
+  extractRecentRealDialogue,
   readAmbientRecordings,
   readInsights,
   readSparks,
   registerDevLabRoutes,
+  resolveMode,
+  resolveRecordingsDir,
 } from '../server/src/conversation/memory/devlab-api.mjs'
 
 function fixture(t) {
@@ -23,6 +26,15 @@ function fixture(t) {
     sparksPath: join(root, 'spark_captures.jsonl'),
     recordingsDir: join(root, 'ambient-recordings'),
   }
+}
+
+function writeAsr(dir, name, segments, second = 0) {
+  mkdirSync(dir, { recursive: true })
+  const path = join(dir, name)
+  writeFileSync(path, JSON.stringify({ batchId: name, segments }))
+  const when = new Date(Date.UTC(2026, 4, 1, 0, 0, second))
+  utimesSync(path, when, when)
+  return path
 }
 
 function fakeApp() {
@@ -232,7 +244,7 @@ test('devlab routes expose insights, sparks, simulation and ambient endpoints wi
 
   res = fakeRes()
   await app.routes.get('POST /api/devlab/insights/simulate')(
-    { body: { preset: 'casual_chat' } }, res,
+    { body: { mode: 'preset', preset: 'casual_chat' } }, res,
   )
   assert.equal(res.statusCode, 200)
   assert.equal(res.body.insight.archetype, '新生成原型')
@@ -243,7 +255,7 @@ test('devlab routes expose insights, sparks, simulation and ambient endpoints wi
   observed.length = 0
   res = fakeRes()
   await app.routes.get('POST /api/devlab/insights/simulate')(
-    { body: { segments: [{ speaker: 'speaker_0', text: '自定义对白' }] } }, res,
+    { body: { mode: 'preset', segments: [{ speaker: 'speaker_0', text: '自定义对白' }] } }, res,
   )
   assert.equal(res.statusCode, 200)
   assert.equal(observed[0].preset, '')
@@ -251,13 +263,13 @@ test('devlab routes expose insights, sparks, simulation and ambient endpoints wi
 
   res = fakeRes()
   await app.routes.get('POST /api/devlab/insights/simulate')(
-    { body: { preset: 'not_a_scene' } }, res,
+    { body: { mode: 'preset', preset: 'not_a_scene' } }, res,
   )
   assert.equal(res.statusCode, 400)
 
   res = fakeRes()
   await app.routes.get('POST /api/devlab/insights/simulate')(
-    { body: { segments: [{ speaker: 'speaker_0', text: 'boom' }] } }, res,
+    { body: { mode: 'preset', segments: [{ speaker: 'speaker_0', text: 'boom' }] } }, res,
   )
   assert.equal(res.statusCode, 503)
   assert.equal(res.body.code, 'devlab_simulation_unavailable')
@@ -271,7 +283,7 @@ test('devlab routes expose insights, sparks, simulation and ambient endpoints wi
 
   res = fakeRes()
   await app.routes.get('POST /api/devlab/sparks/simulate')(
-    { body: { preset: 'roast_glasses' } }, res,
+    { body: { mode: 'preset', preset: 'roast_glasses' } }, res,
   )
   assert.equal(res.statusCode, 200)
   assert.equal(res.body.spark.has_spark, true)
@@ -283,7 +295,7 @@ test('devlab routes expose insights, sparks, simulation and ambient endpoints wi
   sparkObserved.length = 0
   res = fakeRes()
   await app.routes.get('POST /api/devlab/sparks/simulate')(
-    { body: { segments: [{ speaker: 'speaker_0', text: '自定义灵感' }] } }, res,
+    { body: { mode: 'preset', segments: [{ speaker: 'speaker_0', text: '自定义灵感' }] } }, res,
   )
   assert.equal(res.statusCode, 200)
   assert.equal(sparkObserved[0].preset, '')
@@ -291,15 +303,192 @@ test('devlab routes expose insights, sparks, simulation and ambient endpoints wi
 
   res = fakeRes()
   await app.routes.get('POST /api/devlab/sparks/simulate')(
-    { body: { preset: 'not_a_scene' } }, res,
+    { body: { mode: 'preset', preset: 'not_a_scene' } }, res,
   )
   assert.equal(res.statusCode, 400)
 
   res = fakeRes()
   await app.routes.get('POST /api/devlab/sparks/simulate')(
-    { body: { segments: [{ speaker: 'speaker_0', text: 'boom' }] } }, res,
+    { body: { mode: 'preset', segments: [{ speaker: 'speaker_0', text: 'boom' }] } }, res,
   )
   assert.equal(res.statusCode, 503)
   assert.equal(res.body.code, 'devlab_simulation_unavailable')
   assert.equal(String(res.body.error).includes('/Users/me'), false)
+})
+
+test('extractRecentRealDialogue scans newest ASR files, drops filler and maps speakers', t => {
+  const { recordingsDir } = fixture(t)
+  for (let index = 0; index < 6; index += 1) {
+    writeAsr(recordingsDir, `batch-${index}.asr.json`, [
+      {
+        speaker: index === 5 ? 'user' : `speaker_${index + 1}`,
+        text: `这是第 ${index} 个真实文件里的一句完整对白。`,
+        started_at: '2026-05-01T10:00:00+08:00',
+      },
+      { speaker: 'unknown_speaker', text: '嗯。' },
+      { speaker: 'speaker_0', text: '嗯嗯' },
+    ], index)
+  }
+
+  const result = extractRecentRealDialogue(recordingsDir)
+  assert.equal(result.fileNames.length, 5)
+  assert.equal(result.fileNames[0], 'batch-5.asr.json')
+  assert.equal(result.totalTurns, 5)
+  assert.ok(result.totalChars > 30)
+  assert.equal(result.turns[0].speaker, 'speaker_0')
+  assert.equal(result.turns[1].speaker, 'speaker_1')
+  // rawSegments keeps everything that was scanned, turns keep only meaningful lines.
+  assert.ok(result.rawSegments.length >= 15)
+  assert.ok(!result.turns.some(turn => ['嗯。', '嗯嗯'].includes(turn.text)))
+  assert.equal(extractRecentRealDialogue(recordingsDir, { maxFiles: 2 }).fileNames.length, 2)
+})
+
+test('mode defaults to real and recordings dir adapts to either install location', t => {
+  assert.equal(resolveMode(undefined), 'real')
+  assert.equal(resolveMode('REAL'), 'real')
+  assert.equal(resolveMode('preset'), 'preset')
+  const { root } = fixture(t)
+  const missing = join(root, 'missing')
+  const present = join(root, 'present')
+  mkdirSync(present, { recursive: true })
+  assert.equal(resolveRecordingsDir(undefined, [missing, present]), present)
+  assert.equal(resolveRecordingsDir(undefined, [missing]), missing)
+  assert.equal(resolveRecordingsDir(join(root, 'explicit'), [missing, present]), join(root, 'explicit'))
+})
+
+test('insights simulate defaults to real mode and refuses filler-only dialogue', async t => {
+  const { insightsPath, recordingsDir } = fixture(t)
+  writeAsr(recordingsDir, 'only-filler.asr.json', [
+    { speaker: 'speaker_0', text: '嗯。' },
+    { speaker: 'unknown_speaker', text: '啊' },
+    { speaker: 'speaker_1', text: '……' },
+  ])
+  const observed = []
+  const app = fakeApp()
+  registerDevLabRoutes(app, {
+    insightsPath,
+    recordingsDir,
+    simulate: async payload => {
+      observed.push(payload)
+      return { archetype: '不该出现的洞察' }
+    },
+  })
+
+  const res = fakeRes()
+  await app.routes.get('POST /api/devlab/insights/simulate')({ body: {} }, res)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.body.success, false)
+  assert.equal(res.body.evaluated, true)
+  assert.equal(res.body.reason, 'insufficient_dialogue')
+  assert.match(res.body.message, /30 字/)
+  assert.deepEqual(res.body.sourceFiles, ['only-filler.asr.json'])
+  assert.equal(observed.length, 0)
+})
+
+test('insights simulate in real mode feeds extracted turns to Python and flags provenance', async t => {
+  const { insightsPath, recordingsDir } = fixture(t)
+  writeAsr(recordingsDir, 'real-a.asr.json', [
+    { speaker: 'user', text: '我们最近在讨论硬件 SDK 的功耗问题。' },
+    { speaker: 'speaker_2', text: '手势唤醒一直开着，待机电流偏高。' },
+  ], 1)
+  writeAsr(recordingsDir, 'real-b.asr.json', [
+    { speaker: 'user', text: '也许可以改成事件触发，只在抬手时采样。' },
+  ], 2)
+  const observed = []
+  const app = fakeApp()
+  registerDevLabRoutes(app, {
+    insightsPath,
+    recordingsDir,
+    simulate: async payload => {
+      observed.push(payload)
+      appendFileSync(insightsPath, insight('真实场域原型', '2026-05-02T00:00:00+08:00') + '\n')
+      return { archetype: '真实场域原型', turn_count: payload.segments.length }
+    },
+  })
+
+  const res = fakeRes()
+  await app.routes.get('POST /api/devlab/insights/simulate')({ body: { mode: 'real' } }, res)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.body.success, true)
+  assert.equal(res.body.insight.archetype, '真实场域原型')
+  assert.equal(res.body.insight.is_real_data, true)
+  assert.deepEqual(res.body.insight.source_files, ['real-b.asr.json', 'real-a.asr.json'])
+  assert.match(observed[0].source, /^devlab:real\|/)
+  assert.equal(observed[0].segments.length, 3)
+  assert.equal(observed[0].segments[0].speaker, 'speaker_0')
+  assert.equal(res.body.items[0].archetype, '真实场域原型')
+})
+
+test('sparks simulate defaults to real mode and reports no_voice with no transcript', async t => {
+  const { sparksPath, recordingsDir } = fixture(t)
+  writeAsr(recordingsDir, 'empty.asr.json', [])
+  const app = fakeApp()
+  registerDevLabRoutes(app, {
+    sparksPath,
+    recordingsDir,
+    sparkSimulate: async () => { throw new Error('should not be called') },
+  })
+
+  const res = fakeRes()
+  await app.routes.get('POST /api/devlab/sparks/simulate')({ body: {} }, res)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.body.success, false)
+  assert.equal(res.body.reason, 'no_voice')
+  assert.deepEqual(res.body.sourceFiles, ['empty.asr.json'])
+})
+
+test('sparks simulate in real mode reports has_spark=false without fabricating a card', async t => {
+  const { sparksPath, recordingsDir } = fixture(t)
+  writeAsr(recordingsDir, 'business.asr.json', [
+    { speaker: 'user', text: '这个需求明天评审，硬件那边再确认一下。' },
+    { speaker: 'speaker_2', text: '好，我把功耗数据整理一下发你。' },
+  ], 1)
+  writeAsr(recordingsDir, 'business-2.asr.json', [
+    { speaker: 'user', text: '收到，那就按这个排期推进。' },
+  ], 2)
+  const observed = []
+  const app = fakeApp()
+  registerDevLabRoutes(app, {
+    sparksPath,
+    recordingsDir,
+    sparkSimulate: async payload => {
+      observed.push(payload)
+      return { has_spark: false, turn_count: payload.segments.length }
+    },
+  })
+
+  const res = fakeRes()
+  await app.routes.get('POST /api/devlab/sparks/simulate')({ body: { mode: 'real' } }, res)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.body.success, true)
+  assert.equal(res.body.evaluated, true)
+  assert.equal(res.body.has_spark, false)
+  assert.match(res.body.message, /3 轮讨论/)
+  assert.deepEqual(res.body.sourceFiles, ['business-2.asr.json', 'business.asr.json'])
+  assert.equal(res.body.spark, undefined)
+  assert.equal(observed[0].segments.length, 3)
+})
+
+test('sparks simulate in real mode flags a genuine spark with provenance', async t => {
+  const { sparksPath, recordingsDir } = fixture(t)
+  writeAsr(recordingsDir, 'idea.asr.json', [
+    { speaker: 'user', text: '我有个新想法，让眼镜在抬手时自动播报一条毒舌点评。' },
+    { speaker: 'speaker_2', text: '这不就是缺德版 AR 滤镜吗？' },
+  ])
+  const app = fakeApp()
+  registerDevLabRoutes(app, {
+    sparksPath,
+    recordingsDir,
+    sparkSimulate: async () => {
+      appendFileSync(sparksPath, spark('真实灵感', '2026-05-02T00:00:00+08:00') + '\n')
+      return { has_spark: true, title: '真实灵感', turn_count: 2 }
+    },
+  })
+
+  const res = fakeRes()
+  await app.routes.get('POST /api/devlab/sparks/simulate')({ body: {} }, res)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.body.success, true)
+  assert.equal(res.body.spark.is_real_data, true)
+  assert.deepEqual(res.body.spark.source_files, ['idea.asr.json'])
 })

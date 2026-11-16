@@ -83,6 +83,44 @@ function isOwner(speaker) {
   return /speaker_0|佩戴者|本人|用户本人|^user$/iu.test(String(speaker || ''))
 }
 
+function isRealData(item) {
+  return item?.is_real_data === true || String(item?.source || '').startsWith('devlab:real')
+}
+
+function sourceFilesOf(item) {
+  if (Array.isArray(item?.source_files) && item.source_files.length) return item.source_files
+  const source = String(item?.source || '')
+  return source.startsWith('devlab:real|')
+    ? source.split('|').slice(1).filter(Boolean)
+    : []
+}
+
+function evaluationStats(stats) {
+  if (!stats) return ''
+  const parts = []
+  if (stats.filesScanned) parts.push(t('已扫描近 {n} 个录音切片', { n: stats.filesScanned }))
+  if (stats.totalTurns) parts.push(t('共 {n} 句对白', { n: stats.totalTurns }))
+  if (stats.totalChars) parts.push(t('有效字数 {n}', { n: stats.totalChars }))
+  return parts.join('，')
+}
+
+function RuleBanner({ evaluation }) {
+  if (!evaluation) return null
+  const files = Array.isArray(evaluation.sourceFiles) ? evaluation.sourceFiles : []
+  return <div className={`devlab-rule-banner ${evaluation.tone || ''}`} role="status">
+    <span className="rule-banner-icon">{evaluation.icon || '🧊'}</span>
+    <div className="rule-banner-body">
+      <strong>{evaluation.title}</strong>
+      {evaluation.message && <p>{evaluation.message}</p>}
+      {evaluationStats(evaluation.stats) && <p className="rule-banner-stats">{evaluationStats(evaluation.stats)}</p>}
+      {files.length > 0 && <div className="rule-banner-files">
+        <span>{t('涉及录音文件')}</span>
+        {files.map(file => <code key={file}>{file}</code>)}
+      </div>}
+    </div>
+  </div>
+}
+
 function EmptyState({ icon, title, hint }) {
   return <div className="devlab-empty">
     <div className="devlab-empty-icon">{icon}</div>
@@ -92,10 +130,15 @@ function EmptyState({ icon, title, hint }) {
 }
 
 function InsightCard({ item, index }) {
+  const real = isRealData(item)
+  const sourceFiles = sourceFilesOf(item)
   return <article className="insight-card" style={{ '--card-delay': `${Math.min(index, 8) * 45}ms` }}>
     <header className="insight-head">
       <span className="archetype-badge">{item.archetype || t('未命名原型')}</span>
-      <time>{formatTime(item.created_at)}</time>
+      <div className="insight-head-meta">
+        {real && <span className="real-data-flag">🟢 {t('真实录音提炼')}</span>}
+        <time>{formatTime(item.created_at)}</time>
+      </div>
     </header>
     <div className="energy-line">
       <span className="energy-dot" />
@@ -103,6 +146,9 @@ function InsightCard({ item, index }) {
     </div>
     <p className="insight-body">{item.insight || t('暂无剖析正文')}</p>
     {item.jungian_quote && <blockquote className="jungian-quote">“{item.jungian_quote}”</blockquote>}
+    {real && sourceFiles.length > 0 && <div className="real-source-line">
+      🎙️ {t('录音来源')}：{sourceFiles.join(' · ')}
+    </div>}
     <footer className="insight-foot">
       <span className="micro-action"><b>⚡ {t('微行动')}</b>{item.recommended_action || '—'}</span>
       <span className="insight-meta">
@@ -113,12 +159,12 @@ function InsightCard({ item, index }) {
   </article>
 }
 
-function InsightsTab({ items, loading, error, busy, onRefresh, onSimulate }) {
+function InsightsTab({ items, loading, error, busy, evaluation, onRefresh, onSimulate }) {
   return <section className="tab-panel">
     <div className="panel-toolbar">
       <div>
         <h2>{t('场域洞察流')}</h2>
-        <p className="panel-sub">{t('由 PWM 认知功能引擎生成的潜意识读数 · 最新在前')}</p>
+        <p className="panel-sub">{t('严格基于最近真实录音 · 字数或轮数不足时规则判定不生成 · 最新在前')}</p>
       </div>
       <div className="toolbar-actions">
         <button type="button" className="devlab-button" onClick={onRefresh} disabled={loading}>
@@ -130,15 +176,16 @@ function InsightsTab({ items, loading, error, busy, onRefresh, onSimulate }) {
           onClick={() => onSimulate('')}
           disabled={busy}
         >
-          {busy ? t('生成中…', {}) : `✦ ${t('一键模拟生成')}`}
+          {busy ? t('扫描中…', {}) : `⚡ ${t('从最近真实录音提炼洞察')}`}
         </button>
       </div>
     </div>
     {error && <div className="devlab-alert" role="alert">⚠ {error}</div>}
+    {!error && <RuleBanner evaluation={evaluation} />}
     {!loading && !error && items.length === 0 && <EmptyState
       icon="🔮"
       title={t('还没有洞察记录')}
-      hint={t('点击「一键模拟生成」，让随身荣格心理导师读一次刚才的场域。')}
+      hint={t('点击「从最近真实录音提炼洞察」，让随身荣格心理导师读一次刚才的真实场域。')}
     />}
     <div className="insight-list">
       {items.map((item, index) => <InsightCard key={`${item.created_at}:${index}`} item={item} index={index} />)}
@@ -147,10 +194,15 @@ function InsightsTab({ items, loading, error, busy, onRefresh, onSimulate }) {
 }
 
 function SparkCard({ item, index }) {
+  const real = isRealData(item)
+  const sourceFiles = sourceFilesOf(item)
   return <article className="spark-card" style={{ '--card-delay': `${Math.min(index, 8) * 45}ms` }}>
     <header className="spark-head">
       <span className="spark-title">{item.title || t('未命名火花')}</span>
-      <time>{formatTime(item.created_at)}</time>
+      <div className="spark-head-meta">
+        {real && <span className="real-data-flag">🟢 {t('真实录音提炼')}</span>}
+        <time>{formatTime(item.created_at)}</time>
+      </div>
     </header>
     {item.user_spark_quote && <blockquote className="spark-quote">
       <span>{t('你的原话 · WEARER SAID')}</span>“{item.user_spark_quote}”
@@ -184,6 +236,9 @@ function SparkCard({ item, index }) {
       <b>⚗ {t('试金石 · REALITY CHECK')}</b>
       <p>{item.reality_check}</p>
     </div>}
+    {real && sourceFiles.length > 0 && <div className="real-source-line">
+      🎙️ {t('录音来源')}：{sourceFiles.join(' · ')}
+    </div>}
     <footer className="spark-foot">
       <span className="insight-meta">
         {item.model ? `⌘ ${item.model}` : ''}
@@ -193,13 +248,13 @@ function SparkCard({ item, index }) {
   </article>
 }
 
-function SparksTab({ items, loading, error, busy, onRefresh, onSimulate }) {
+function SparksTab({ items, loading, error, busy, evaluation, onRefresh, onSimulate }) {
   return <section className="tab-panel">
     <div className="panel-toolbar">
       <div>
         <h2>{t('灵感火花流')}</h2>
         <p className="panel-sub">
-          {t('只有佩戴者亲口说出的新点子才会被捕获 · 毒舌投资人已就位 · 最新在前')}
+          {t('严格扫描最近真实对白 · 未提出新构想时规则判定无火花，不打扰 · 最新在前')}
         </p>
       </div>
       <div className="toolbar-actions">
@@ -212,15 +267,16 @@ function SparksTab({ items, loading, error, busy, onRefresh, onSimulate }) {
           onClick={() => onSimulate('', 'spark')}
           disabled={busy}
         >
-          {busy ? t('诊断中…', {}) : `✦ ${t('模拟捕获新灵感')}`}
+          {busy ? t('扫描中…', {}) : `💡 ${t('从最近真实对白扫描灵感')}`}
         </button>
       </div>
     </div>
     {error && <div className="devlab-alert" role="alert">⚠ {error}</div>}
+    {!error && <RuleBanner evaluation={evaluation} />}
     {!loading && !error && items.length === 0 && <EmptyState
       icon="💡"
       title={t('还没有灵感火花')}
-      hint={t('点击「模拟捕获新灵感」，让毒舌投资人诊断一次佩戴者亲口说出的点子。')}
+      hint={t('点击「从最近真实对白扫描灵感」，让毒舌投资人诊断一次佩戴者亲口说出的点子。')}
     />}
     <div className="spark-list">
       {items.map((item, index) => <SparkCard key={`${item.created_at}:${index}`} item={item} index={index} />)}
@@ -282,7 +338,7 @@ function EventsTab({ busy, onSimulate, error }) {
     <div className="panel-toolbar">
       <div>
         <h2>{t('场景事件模拟器')}</h2>
-        <p className="panel-sub">{t('选择一段对白预设，直接验证认知功能洞察的触发效果。')}</p>
+        <p className="panel-sub">{t('使用 Mock 预设对白验证全量触发效果（不影响真实数据模式）。')}</p>
       </div>
     </div>
     {error && <div className="devlab-alert" role="alert">⚠ {error}</div>}
@@ -320,6 +376,8 @@ export default function DevLabCenter() {
   const [ambientError, setAmbientError] = useState('')
   const [busy, setBusy] = useState('')
   const [simulateError, setSimulateError] = useState('')
+  const [insightEval, setInsightEval] = useState(null)
+  const [sparkEval, setSparkEval] = useState(null)
   const [notice, setNotice] = useState('')
   const noticeTimer = useRef(null)
 
@@ -389,31 +447,54 @@ export default function DevLabCenter() {
 
   const simulate = useCallback(async (preset, kind) => {
     const isSpark = kind === 'spark'
+    const isPreset = Boolean(preset)
     setBusy(`${isSpark ? 'spark:' : ''}${preset || 'default'}`)
     setSimulateError('')
+    if (isSpark) setSparkEval(null)
+    else setInsightEval(null)
     try {
       if (isSpark) {
         const payload = await readJson('/api/devlab/sparks/simulate', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(preset ? { preset } : {}),
+          body: JSON.stringify(isPreset ? { mode: 'preset', preset } : { mode: 'real' }),
         })
-        const spark = payload?.spark
-        if (spark?.has_spark) flash(`${t('灵感已捕获')}：${spark.title}`)
-        else flash(t('本次对话无灵感火花，静默跳过'))
-        setSparks(Array.isArray(payload.items) ? payload.items : [])
+        if (Array.isArray(payload.items)) setSparks(payload.items)
+        if (payload.has_spark === false || payload.reason) {
+          setSparkEval({
+            tone: payload.reason === 'no_voice' ? 'no-voice' : 'no-spark',
+            icon: payload.reason === 'no_voice' ? '🎙️' : '🫧',
+            title: payload.reason === 'no_voice'
+              ? t('规则判定 · 无有效语音')
+              : t('规则判定 · 无灵感火花'),
+            message: payload.message || t('佩戴者未提出新颖创意或假设，未触发灵感打扰。'),
+            stats: payload.stats,
+            sourceFiles: payload.sourceFiles,
+          })
+        } else if (payload.spark?.has_spark) {
+          flash(`${t('真实录音已捕获灵感')}：${payload.spark.title}`)
+        }
         setActiveTab('sparks')
         return
       }
       const payload = await readJson('/api/devlab/insights/simulate', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(preset ? { preset } : {}),
+        body: JSON.stringify(isPreset ? { mode: 'preset', preset } : { mode: 'real' }),
       })
-      const insight = payload?.insight
-      if (insight?.archetype) flash(`${t('洞察已生成')}：${insight.archetype}`)
-      else flash(t('洞察已生成'))
-      setInsights(Array.isArray(payload.items) ? payload.items : [])
+      if (Array.isArray(payload.items)) setInsights(payload.items)
+      if (payload.success === false || payload.reason === 'insufficient_dialogue') {
+        setInsightEval({
+          tone: 'insufficient',
+          icon: '🧊',
+          title: t('规则判定 · 未生成洞察'),
+          message: payload.message || t('有效对白不足以凝聚场域，未触发洞察打扰。'),
+          stats: payload.stats,
+          sourceFiles: payload.sourceFiles,
+        })
+      } else if (payload.insight?.archetype) {
+        flash(`${t('真实录音已提炼洞察')}：${payload.insight.archetype}`)
+      }
       setActiveTab('insights')
     } catch (error) {
       setSimulateError(error?.message || t('模拟生成失败'))
@@ -455,6 +536,7 @@ export default function DevLabCenter() {
         loading={insightsLoading}
         error={insightsError}
         busy={Boolean(busy)}
+        evaluation={insightEval}
         onRefresh={() => void loadInsights()}
         onSimulate={preset => void simulate(preset)}
       />}
@@ -463,6 +545,7 @@ export default function DevLabCenter() {
         loading={sparksLoading}
         error={sparksError}
         busy={Boolean(busy)}
+        evaluation={sparkEval}
         onRefresh={() => void loadSparks()}
         onSimulate={(preset, kind) => void simulate(preset, kind)}
       />}

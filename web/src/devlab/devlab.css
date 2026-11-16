@@ -280,6 +280,123 @@
   font-size: 12px;
 }
 
+/* Rule-evaluation status banner: grey-gold / blue-grey, never a success card. */
+.devlab-rule-banner {
+  display: flex;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding: 16px 18px;
+  border: 1px solid rgba(200, 165, 91, 0.26);
+  border-radius: 13px;
+  background: linear-gradient(120deg, rgba(140, 148, 163, 0.12), rgba(200, 165, 91, 0.055));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 10px 28px rgba(0, 0, 0, 0.22);
+  animation: card-in 280ms ease both;
+}
+
+.devlab-rule-banner.no-spark {
+  border-color: rgba(120, 152, 178, 0.32);
+  background: linear-gradient(120deg, rgba(97, 128, 158, 0.16), rgba(200, 165, 91, 0.035));
+}
+
+.devlab-rule-banner.no-voice {
+  border-color: rgba(150, 152, 158, 0.26);
+  background: linear-gradient(120deg, rgba(130, 132, 138, 0.13), rgba(255, 255, 255, 0.02));
+}
+
+.rule-banner-icon {
+  flex: none;
+  font-size: 22px;
+  line-height: 1.3;
+  filter: saturate(0.7);
+}
+
+.rule-banner-body {
+  min-width: 0;
+  color: #c9c9c4;
+}
+
+.rule-banner-body strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #ddd0ae;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.devlab-rule-banner.no-spark .rule-banner-body strong {
+  color: #bcd2e2;
+}
+
+.rule-banner-body p {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  line-height: 1.8;
+}
+
+.rule-banner-stats {
+  color: #909398 !important;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px !important;
+}
+
+.rule-banner-files {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.rule-banner-files > span {
+  margin-right: 2px;
+  color: #8b8b90;
+  font-size: 11px;
+}
+
+.rule-banner-files code {
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.26);
+  color: #b9b7ad;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  word-break: break-all;
+}
+
+/* Real-data provenance on successfully generated cards. */
+.insight-head-meta,
+.spark-head-meta {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.real-data-flag {
+  padding: 4px 9px;
+  border: 1px solid rgba(87, 215, 196, 0.35);
+  border-radius: 999px;
+  background: rgba(87, 215, 196, 0.1);
+  color: #7ce0d0;
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.real-source-line {
+  margin-top: 14px;
+  padding: 8px 11px;
+  border: 1px dashed rgba(200, 165, 91, 0.28);
+  border-radius: 8px;
+  background: rgba(200, 165, 91, 0.05);
+  color: #aaa798;
+  font-size: 11px;
+  line-height: 1.7;
+  word-break: break-all;
+}
+
 .devlab-toast {
   position: fixed;
   top: 22px;
@@ -825,6 +942,8 @@
   .toolbar-actions .devlab-button { flex: 1; }
   .insight-foot { flex-direction: column; align-items: flex-start; }
   .insight-meta { text-align: left; }
+  .devlab-rule-banner { padding: 13px 14px; gap: 10px; }
+  .insight-head-meta, .spark-head-meta { flex-direction: column; align-items: flex-end; gap: 5px; }
   .spark-list { columns: 1; }
   .spark-duo { grid-template-columns: 1fr; }
   .devlab-footer { flex-direction: column; gap: 6px; }
