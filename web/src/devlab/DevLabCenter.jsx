@@ -5,6 +5,7 @@ import './devlab.css'
 
 const TABS = [
   { id: 'insights', icon: '🔮', label: '场域洞察', sub: 'MBTI INSIGHTS' },
+  { id: 'sparks', icon: '💡', label: '灵感捕获 (Sparks)', sub: 'SPARK CAPTURE' },
   { id: 'ambient', icon: '🎙️', label: '环境音轨探针', sub: 'AMBIENT ASR' },
   { id: 'events', icon: '⚡', label: '场景事件模拟器', sub: 'EVENT SIMULATOR' },
 ]
@@ -30,6 +31,22 @@ const SCENARIOS = [
     title: '独自散步自言自语',
     tag: '内省沉思 · 影子浮现',
     desc: '只有佩戴者一个人的声音，脚步与风声之间，那些没说出口的话浮上来。',
+  },
+  {
+    preset: 'roast_glasses',
+    kind: 'spark',
+    icon: '💡',
+    title: '毒舌眼镜：实时吐槽周围人',
+    tag: '灵感火花 · 毒舌诊断',
+    desc: '佩戴者主动提出给眼镜做个能实时吐槽周围人的功能，验证灵感捕获与辣评链路。',
+  },
+  {
+    preset: 'subconscious_cloud',
+    kind: 'spark',
+    icon: '🧠',
+    title: '赛博外脑：外包潜意识',
+    tag: '灵感火花 · 脑洞延伸',
+    desc: '佩戴者想把梦和潜意识也交给眼镜记录，看看毒舌投资人怎么拆穿这场自嗨。',
   },
 ]
 
@@ -129,6 +146,88 @@ function InsightsTab({ items, loading, error, busy, onRefresh, onSimulate }) {
   </section>
 }
 
+function SparkCard({ item, index }) {
+  return <article className="spark-card" style={{ '--card-delay': `${Math.min(index, 8) * 45}ms` }}>
+    <header className="spark-head">
+      <span className="spark-title">{item.title || t('未命名火花')}</span>
+      <time>{formatTime(item.created_at)}</time>
+    </header>
+    {item.user_spark_quote && <blockquote className="spark-quote">
+      <span>{t('你的原话 · WEARER SAID')}</span>“{item.user_spark_quote}”
+    </blockquote>}
+    {item.the_pitch && <p className="spark-pitch">{item.the_pitch}</p>}
+    <div className="spark-duo">
+      <div className="spark-capsule pro">
+        <b>✦ PROS · {t('诱人之处')}</b>
+        <p>{item.pros || '—'}</p>
+      </div>
+      <div className="spark-capsule con">
+        <b>✕ CONS · {t('致命盲点')}</b>
+        <p>{item.cons || '—'}</p>
+      </div>
+    </div>
+    {(item.extension || item.relevance) && <div className="spark-sections">
+      {item.extension && <div className="spark-section">
+        <b>∞ {t('极致延伸')}</b>
+        <p>{item.extension}</p>
+      </div>}
+      {item.relevance && <div className="spark-section">
+        <b>◎ {t('现实关联')}</b>
+        <p>{item.relevance}</p>
+      </div>}
+    </div>}
+    {item.spicy_verdict && <blockquote className="spark-verdict">
+      <span>{t('毒舌终审 · SPICY VERDICT')}</span>
+      {item.spicy_verdict}
+    </blockquote>}
+    {item.reality_check && <div className="spark-reality">
+      <b>⚗ {t('试金石 · REALITY CHECK')}</b>
+      <p>{item.reality_check}</p>
+    </div>}
+    <footer className="spark-foot">
+      <span className="insight-meta">
+        {item.model ? `⌘ ${item.model}` : ''}
+        {item.turn_count ? ` · ${t('{n} 轮对白', { n: item.turn_count })}` : ''}
+      </span>
+    </footer>
+  </article>
+}
+
+function SparksTab({ items, loading, error, busy, onRefresh, onSimulate }) {
+  return <section className="tab-panel">
+    <div className="panel-toolbar">
+      <div>
+        <h2>{t('灵感火花流')}</h2>
+        <p className="panel-sub">
+          {t('只有佩戴者亲口说出的新点子才会被捕获 · 毒舌投资人已就位 · 最新在前')}
+        </p>
+      </div>
+      <div className="toolbar-actions">
+        <button type="button" className="devlab-button" onClick={onRefresh} disabled={loading}>
+          {loading ? t('读取中…') : `↻ ${t('刷新')}`}
+        </button>
+        <button
+          type="button"
+          className="devlab-button primary sparky"
+          onClick={() => onSimulate('', 'spark')}
+          disabled={busy}
+        >
+          {busy ? t('诊断中…', {}) : `✦ ${t('模拟捕获新灵感')}`}
+        </button>
+      </div>
+    </div>
+    {error && <div className="devlab-alert" role="alert">⚠ {error}</div>}
+    {!loading && !error && items.length === 0 && <EmptyState
+      icon="💡"
+      title={t('还没有灵感火花')}
+      hint={t('点击「模拟捕获新灵感」，让毒舌投资人诊断一次佩戴者亲口说出的点子。')}
+    />}
+    <div className="spark-list">
+      {items.map((item, index) => <SparkCard key={`${item.created_at}:${index}`} item={item} index={index} />)}
+    </div>
+  </section>
+}
+
 function AmbientTab({ recordings, loading, error, onRefresh }) {
   const segments = recordings.flatMap(recording => (recording.segments || []).map(segment => ({
     ...segment,
@@ -195,11 +294,13 @@ function EventsTab({ busy, onSimulate, error }) {
         <p>{scenario.desc}</p>
         <button
           type="button"
-          className="devlab-button primary block"
-          onClick={() => onSimulate(scenario.preset)}
+          className={`devlab-button primary block${scenario.kind === 'spark' ? ' sparky' : ''}`}
+          onClick={() => onSimulate(scenario.preset, scenario.kind)}
           disabled={busy}
         >
-          {busy === scenario.preset ? t('触发中…') : t('模拟触发此场景')}
+          {busy === scenario.preset || busy === `spark:${scenario.preset}`
+            ? t('触发中…')
+            : t('模拟触发此场景')}
         </button>
       </article>)}
     </div>
@@ -211,6 +312,9 @@ export default function DevLabCenter() {
   const [insights, setInsights] = useState([])
   const [insightsLoading, setInsightsLoading] = useState(false)
   const [insightsError, setInsightsError] = useState('')
+  const [sparks, setSparks] = useState([])
+  const [sparksLoading, setSparksLoading] = useState(false)
+  const [sparksError, setSparksError] = useState('')
   const [recordings, setRecordings] = useState([])
   const [ambientLoading, setAmbientLoading] = useState(false)
   const [ambientError, setAmbientError] = useState('')
@@ -239,6 +343,20 @@ export default function DevLabCenter() {
     }
   }, [])
 
+  const loadSparks = useCallback(async signal => {
+    setSparksLoading(true)
+    setSparksError('')
+    try {
+      const payload = await readJson('/api/devlab/sparks', {}, signal)
+      if (signal?.aborted) return
+      setSparks(Array.isArray(payload.items) ? payload.items : [])
+    } catch (error) {
+      if (error?.name !== 'AbortError') setSparksError(error?.message || t('读取灵感火花失败'))
+    } finally {
+      if (!signal?.aborted) setSparksLoading(false)
+    }
+  }, [])
+
   const loadAmbient = useCallback(async signal => {
     setAmbientLoading(true)
     setAmbientError('')
@@ -256,9 +374,10 @@ export default function DevLabCenter() {
   useEffect(() => {
     const controller = new AbortController()
     void loadInsights(controller.signal)
+    void loadSparks(controller.signal)
     void loadAmbient(controller.signal)
     return () => controller.abort()
-  }, [loadInsights, loadAmbient])
+  }, [loadInsights, loadSparks, loadAmbient])
 
   useEffect(() => {
     if (activeTab !== 'ambient') return undefined
@@ -268,10 +387,24 @@ export default function DevLabCenter() {
 
   useEffect(() => () => clearTimeout(noticeTimer.current), [])
 
-  const simulate = useCallback(async preset => {
-    setBusy(preset || 'default')
+  const simulate = useCallback(async (preset, kind) => {
+    const isSpark = kind === 'spark'
+    setBusy(`${isSpark ? 'spark:' : ''}${preset || 'default'}`)
     setSimulateError('')
     try {
+      if (isSpark) {
+        const payload = await readJson('/api/devlab/sparks/simulate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(preset ? { preset } : {}),
+        })
+        const spark = payload?.spark
+        if (spark?.has_spark) flash(`${t('灵感已捕获')}：${spark.title}`)
+        else flash(t('本次对话无灵感火花，静默跳过'))
+        setSparks(Array.isArray(payload.items) ? payload.items : [])
+        setActiveTab('sparks')
+        return
+      }
       const payload = await readJson('/api/devlab/insights/simulate', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -325,6 +458,14 @@ export default function DevLabCenter() {
         onRefresh={() => void loadInsights()}
         onSimulate={preset => void simulate(preset)}
       />}
+      {activeTab === 'sparks' && <SparksTab
+        items={sparks}
+        loading={sparksLoading}
+        error={sparksError}
+        busy={Boolean(busy)}
+        onRefresh={() => void loadSparks()}
+        onSimulate={(preset, kind) => void simulate(preset, kind)}
+      />}
       {activeTab === 'ambient' && <AmbientTab
         recordings={recordings}
         loading={ambientLoading}
@@ -334,7 +475,7 @@ export default function DevLabCenter() {
       {activeTab === 'events' && <EventsTab
         busy={busy}
         error={simulateError}
-        onSimulate={preset => void simulate(preset)}
+        onSimulate={(preset, kind) => void simulate(preset, kind)}
       />}
     </main>
 

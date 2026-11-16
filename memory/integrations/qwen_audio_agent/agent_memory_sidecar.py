@@ -49,10 +49,12 @@ _SENSITIVE = re.compile(
     re.IGNORECASE,
 )
 _MAX_SEEN_IDS = 20_000
-# Rolling dialogue snapshot used only by the MBTI field-insight hook. It is
-# kept out of the memory database so finalize/watermark semantics stay intact.
+# Rolling dialogue snapshot used only by the field-insight / spark-capture
+# hooks. It is kept out of the memory database so finalize/watermark semantics
+# stay intact.
 _MAX_DIALOGUE_TURNS = 200
 _MBTI_SERVICE_CLASS = None
+_SPARK_SERVICE_CLASS = None
 
 
 def _mbti_service_class():
@@ -70,6 +72,23 @@ def _mbti_service_class():
         spec.loader.exec_module(module)
         _MBTI_SERVICE_CLASS = module.MBTIInsightService
     return _MBTI_SERVICE_CLASS
+
+
+def _spark_service_class():
+    """Load the spark-capture service by path so import works from any cwd."""
+    global _SPARK_SERVICE_CLASS
+    if _SPARK_SERVICE_CLASS is None:
+        module_path = Path(__file__).resolve().with_name("spark_capture_service.py")
+        spec = importlib.util.spec_from_file_location(
+            "_qwaudio_spark_capture_service", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load spark capture service module")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _SPARK_SERVICE_CLASS = module.SparkCaptureService
+    return _SPARK_SERVICE_CLASS
 
 
 def _dialogue_turn(speaker: Any, text: Any) -> Optional[Dict[str, Any]]:
@@ -212,6 +231,7 @@ class AgentMemoryRuntime:
         self._logger = logger
         self._owners: Dict[str, OwnerRuntime] = {}
         self._mbti_service = None  # Lazily created by _trigger_mbti_insight.
+        self._spark_service = None  # Lazily created by _trigger_spark_capture.
         self._operation_lock = threading.RLock()
         self._meeting_imports = FeishuMeetingImports(
             owner_directory=lambda owner: self._owner_dir / _owner_key(owner),
@@ -368,6 +388,34 @@ class AgentMemoryRuntime:
             # Insight is purely cosmetic; finalize must never fail because of it.
             self._logger.debug("MBTI insight hook skipped: %s", exc)
 
+    def _trigger_spark_capture(
+        self,
+        holder: OwnerRuntime,
+        turns: List[Dict[str, Any]],
+        *,
+        source: str,
+    ) -> None:
+        """Fire the spark-capture hook without ever blocking or breaking finalize."""
+        if not turns:
+            return
+        try:
+            service_class = _spark_service_class()
+            if self._spark_service is None:
+                self._spark_service = service_class(logger=self._logger)
+            # Reuse the owner's PWM language model so critique uses exactly the
+            # same model/base_url/api_key/json_mode/thinking as memory.
+            self._spark_service.generate_spark_async(
+                segments=list(turns),
+                source=source,
+                llm_client=holder.pwm.llm_client,
+            )
+            self._logger.info(
+                "Spark capture queued source=%s turns=%s", source, len(turns),
+            )
+        except Exception as exc:
+            # Spark capture is purely cosmetic; finalize must never fail because of it.
+            self._logger.debug("Spark capture hook skipped: %s", exc)
+
     @staticmethod
     def _assistant_text_by_turn(messages: List[Dict[str, Any]]) -> Dict[str, str]:
         values: Dict[str, List[str]] = {}
@@ -391,7 +439,7 @@ class AgentMemoryRuntime:
         messages = [
             item for item in params.get("messages") or [] if isinstance(item, dict)
         ]
-        # Snapshot the just-spoken dialogue for the optional MBTI insight hook.
+        # Snapshot the just-spoken dialogue for the optional field-insight hooks.
         # This is independent of the memory dedupe/watermark path below.
         dialogue_turns = []
         for message in messages:
@@ -567,7 +615,7 @@ class AgentMemoryRuntime:
                 ],
             ]))
             transcript_segments.append(segment)
-        # Buffer the ASR lines for the recording-scoped MBTI insight hook.
+        # Buffer the ASR lines for the recording-scoped field-insight hooks.
         # speaker_0 is the wearer per the field-insight convention.
         dialogue_turns = []
         for segment in transcript_segments:
@@ -644,7 +692,10 @@ class AgentMemoryRuntime:
         # Fire-and-forget: consume the buffered ASR lines for this recording.
         recording_turns = holder.recording_dialogue.pop(recording_id, [])
         self._trigger_mbti_insight(
-            holder, recording_turns, source=f"ambient_recording:{recording_id}",
+            holder, list(recording_turns), source=f"ambient_recording:{recording_id}",
+        )
+        self._trigger_spark_capture(
+            holder, list(recording_turns), source=f"ambient_recording:{recording_id}",
         )
         return result
 
@@ -707,7 +758,10 @@ class AgentMemoryRuntime:
             session_turns = list(holder.recent_dialogue)
             holder.recent_dialogue.clear()
             self._trigger_mbti_insight(
-                holder, session_turns, source=f"session_end:{session_id}",
+                holder, list(session_turns), source=f"session_end:{session_id}",
+            )
+            self._trigger_spark_capture(
+                holder, list(session_turns), source=f"session_end:{session_id}",
             )
         return result
 

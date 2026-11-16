@@ -16,6 +16,9 @@ const BUNDLED_PYTHON = join(PROJECT_ROOT, 'memory/.venv/bin/python')
 const DEFAULT_INSIGHTS_PATH = join(
   homedir(), '.config/qwaudio/data/memory/mbti_insights.jsonl',
 )
+const DEFAULT_SPARK_PATH = join(
+  homedir(), '.config/qwaudio/data/memory/spark_captures.jsonl',
+)
 const DEFAULT_RECORDINGS_DIR = join(
   homedir(), '.config/qwaudio/data/memory/ambient-recordings',
 )
@@ -55,6 +58,33 @@ export const DEVLAB_PRESETS = Object.freeze({
   ],
 })
 
+// Spark presets always put the new idea in speaker_0's mouth: the wearer must
+// actively voice the spark, otherwise the Python service returns no_spark.
+export const SPARK_PRESETS = Object.freeze({
+  roast_glasses: [
+    { speaker: 'speaker_1', text: '下班了，随便聊聊。你最近那副眼镜还顺手吗？' },
+    { speaker: 'speaker_0', text: '还行吧，就是它只会提醒我开会，太没劲了。诶我有个想法——' },
+    { speaker: 'speaker_0', text: '给眼镜加个 real-time 吐槽模式：看到谁就在我耳朵边小声毒舌他，只给我一个人听，脸上还得保持微笑，外人完全看不出来。' },
+    { speaker: 'speaker_1', text: '哈哈这不就是缺德版 AR 滤镜吗？' },
+    { speaker: 'speaker_0', text: '对，但重点是它得学会我的刻薄语气，越熟的人吐槽越狠；我觉得这比什么 AI 秘书有用一万倍。' },
+    { speaker: 'speaker_0', text: '甚至可以做会员订阅：升级后连对方的心率都能编成段子。' },
+  ],
+  subconscious_cloud: [
+    { speaker: 'speaker_0', text: '（一个人戴着眼镜散步，突然停下来）我刚才想到一个有点疯的东西。' },
+    { speaker: 'speaker_0', text: '能不能让眼镜把我的梦和潜意识也记下来？睡着后它继续看、继续听，早上给我一份「昨夜的我到底在想什么」的简报。' },
+    { speaker: 'speaker_1', text: '你这是要把脑子外包给硬件啊？' },
+    { speaker: 'speaker_0', text: '对，就叫赛博外脑：把潜意识外包给眼镜。比记事本狠多了，它记得连我自己都不承认的念头。' },
+  ],
+})
+
+const SPARK_PRESET_ALIASES = Object.freeze({
+  glasses: 'roast_glasses',
+  roast: 'roast_glasses',
+  toxic_glasses: 'roast_glasses',
+  cyber_brain: 'subconscious_cloud',
+  dream: 'subconscious_cloud',
+})
+
 const PRESET_ALIASES = Object.freeze({
   brainstorm: 'casual_chat',
   casual_brainstorm: 'casual_chat',
@@ -81,6 +111,13 @@ function resolvePreset(value) {
   if (!key) return ''
   if (Object.hasOwn(DEVLAB_PRESETS, key)) return key
   return PRESET_ALIASES[key] || ''
+}
+
+function resolveSparkPreset(value) {
+  const key = clean(value, 64).toLowerCase()
+  if (!key) return ''
+  if (Object.hasOwn(SPARK_PRESETS, key)) return key
+  return SPARK_PRESET_ALIASES[key] || ''
 }
 
 function normalizeTurns(value, maxChars = 4_000) {
@@ -129,6 +166,49 @@ export function readInsights(insightsPath = DEFAULT_INSIGHTS_PATH, limit = DEFAU
       const parsed = JSON.parse(line)
       const insight = normalizeInsight(parsed)
       if (insight) records.push(insight)
+    } catch {
+      // A truncated or foreign line must not hide the valid records around it.
+    }
+  }
+  return records.reverse().slice(0, boundedInteger(limit, DEFAULT_INSIGHT_LIMIT, 200))
+}
+
+function normalizeSpark(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return null
+  const spark = {
+    has_spark: record.has_spark === true,
+    title: clean(record.title, 120),
+    user_spark_quote: clean(record.user_spark_quote, 1_000),
+    the_pitch: clean(record.the_pitch, 1_000),
+    pros: clean(record.pros, 2_000),
+    cons: clean(record.cons, 2_000),
+    extension: clean(record.extension, 2_000),
+    relevance: clean(record.relevance, 2_000),
+    spicy_verdict: clean(record.spicy_verdict, 1_000),
+    reality_check: clean(record.reality_check, 1_000),
+    created_at: clean(record.created_at, 60),
+    model: clean(record.model, 120),
+    source: clean(record.source, 80),
+    provider: clean(record.provider, 80),
+  }
+  const turnCount = Number(record.turn_count)
+  spark.turn_count = Number.isSafeInteger(turnCount) && turnCount >= 0 ? turnCount : null
+  return spark
+}
+
+export function readSparks(sparksPath = DEFAULT_SPARK_PATH, limit = DEFAULT_INSIGHT_LIMIT) {
+  if (!sparksPath || !existsSync(sparksPath)) return []
+  const text = readFileSync(sparksPath, 'utf8')
+  const records = []
+  for (const line of text.split(/\r?\n/u)) {
+    if (!line.trim()) continue
+    try {
+      const parsed = JSON.parse(line)
+      // Only cards that actually passed the wearer-authored spark gate are
+      // ever persisted, but stay defensive about foreign/old lines.
+      if (parsed?.has_spark !== true) continue
+      const spark = normalizeSpark(parsed)
+      if (spark) records.push(spark)
     } catch {
       // A truncated or foreign line must not hide the valid records around it.
     }
@@ -262,6 +342,36 @@ record = service.generate_insight(
 sys.stdout.write(json.dumps(record or {}, ensure_ascii=False) + "\\n")
 `
 
+// Same inline-execution strategy for spark capture. A no-spark conversation
+// returns {"has_spark": false} and is never persisted by the Python service.
+const PYTHON_SPARK_SIMULATE_SCRIPT = `
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+sys.path.insert(0, str(repo_root))
+service_path = repo_root / "memory" / "integrations" / "qwen_audio_agent" / "spark_capture_service.py"
+spec = importlib.util.spec_from_file_location("devlab_spark_capture_service", service_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+SparkCaptureService = module.SparkCaptureService
+
+payload = json.loads(sys.argv[2])
+SparkCaptureService._apply_desktop_pwm_env()
+service = SparkCaptureService(
+    output_path=payload.get("sparksPath") or None,
+    config_path=payload.get("configPath") or None,
+)
+record = service.generate_spark(
+    segments=payload.get("segments") or None,
+    messages=payload.get("messages") or None,
+    source=payload.get("source") or "devlab_simulate",
+)
+sys.stdout.write(json.dumps(record or {}, ensure_ascii=False) + "\\n")
+`
+
 export function resolvePythonCommand(options = {}, env = process.env) {
   if (options.pythonCommand) return options.pythonCommand
   const configured = String(env.AGENT_MEMORY_PYTHON || '').trim()
@@ -270,7 +380,7 @@ export function resolvePythonCommand(options = {}, env = process.env) {
   return process.platform === 'win32' ? 'python' : 'python3'
 }
 
-export function createPythonSimulator(options = {}) {
+function createInlinePythonSimulator(script, options, { optionsKey, payloadKey, defaultPath, normalizer }) {
   const command = resolvePythonCommand(options)
   const projectRoot = options.projectRoot || PROJECT_ROOT
   const timeoutMs = options.simulateTimeoutMs || DEFAULT_SIMULATE_TIMEOUT_MS
@@ -279,13 +389,13 @@ export function createPythonSimulator(options = {}) {
       segments,
       messages,
       source: clean(source, 80) || 'devlab_simulate',
-      outputPath: options.insightsPath || DEFAULT_INSIGHTS_PATH,
+      [payloadKey]: options[optionsKey] || defaultPath,
       configPath: options.configPath || '',
     }
     return new Promise((resolveSim, rejectSim) => {
       let child
       try {
-        child = spawn(command, ['-c', PYTHON_SIMULATE_SCRIPT, projectRoot, JSON.stringify(payload)], {
+        child = spawn(command, ['-c', script, projectRoot, JSON.stringify(payload)], {
           cwd: projectRoot,
           env: { ...process.env },
           stdio: ['ignore', 'pipe', 'pipe'],
@@ -329,19 +439,41 @@ export function createPythonSimulator(options = {}) {
           ))
           return
         }
-        finish(null, normalizeInsight(parsed))
+        finish(null, normalizer(parsed))
       })
     })
   }
 }
 
+export function createPythonSimulator(options = {}) {
+  return createInlinePythonSimulator(PYTHON_SIMULATE_SCRIPT, options, {
+    optionsKey: 'insightsPath',
+    payloadKey: 'outputPath',
+    defaultPath: DEFAULT_INSIGHTS_PATH,
+    normalizer: normalizeInsight,
+  })
+}
+
+export function createSparkPythonSimulator(options = {}) {
+  return createInlinePythonSimulator(PYTHON_SPARK_SIMULATE_SCRIPT, options, {
+    optionsKey: 'sparksPath',
+    payloadKey: 'sparksPath',
+    defaultPath: DEFAULT_SPARK_PATH,
+    normalizer: normalizeSpark,
+  })
+}
+
 export function registerDevLabRoutes(app, options = {}) {
   const insightsPath = options.insightsPath || DEFAULT_INSIGHTS_PATH
+  const sparksPath = options.sparksPath || DEFAULT_SPARK_PATH
   const recordingsDir = options.recordingsDir || DEFAULT_RECORDINGS_DIR
   const insightLimit = boundedInteger(options.insightLimit, DEFAULT_INSIGHT_LIMIT, 200)
   const simulate = typeof options.simulate === 'function'
     ? options.simulate
     : createPythonSimulator(options)
+  const sparkSimulate = typeof options.sparkSimulate === 'function'
+    ? options.sparkSimulate
+    : createSparkPythonSimulator(options)
 
   app.get('/api/devlab/insights', (_req, res) => {
     res.setHeader('cache-control', 'no-store')
@@ -377,6 +509,51 @@ export function registerDevLabRoutes(app, options = {}) {
       let items = []
       try { items = readInsights(insightsPath, insightLimit) } catch {}
       return res.json({ insight, items })
+    } catch {
+      // Raw stderr/paths may contain credentials or absolute locations: only a
+      // fixed, friendly message is sent to the UI (details stay in the logs of
+      // the Python side-car that produced them).
+      return res.status(503).json({
+        code: 'devlab_simulation_unavailable',
+        error: '模拟生成失败，请检查 Python side-car 与模型配置后重试',
+      })
+    }
+  })
+
+  app.get('/api/devlab/sparks', (_req, res) => {
+    res.setHeader('cache-control', 'no-store')
+    try {
+      const items = readSparks(sparksPath, insightLimit)
+      return res.json({ items, total: items.length })
+    } catch {
+      return res.status(503).json({ code: 'devlab_sparks_unavailable', items: [] })
+    }
+  })
+
+  app.post('/api/devlab/sparks/simulate', async (req, res) => {
+    res.setHeader('cache-control', 'no-store')
+    const body = req.body && typeof req.body === 'object' ? req.body : {}
+    const preset = resolveSparkPreset(body.preset)
+    if (body.preset !== undefined && body.preset !== null && body.preset !== '' && !preset) {
+      return res.status(400).json({ code: 'invalid_devlab_preset' })
+    }
+    let turns = normalizeTurns(body.segments)
+    if (!turns.length) turns = normalizeTurns(body.messages)
+    if (!turns.length) turns = preset ? [...SPARK_PRESETS[preset]] : [...SPARK_PRESETS.roast_glasses]
+    const source = preset ? `devlab:spark:${preset}` : 'devlab:spark:custom'
+    try {
+      const spark = await sparkSimulate({
+        segments: turns,
+        messages: [],
+        source,
+        preset,
+      })
+      if (!spark) {
+        return res.status(502).json({ code: 'devlab_simulation_empty' })
+      }
+      let items = []
+      try { items = readSparks(sparksPath, insightLimit) } catch {}
+      return res.json({ spark, items })
     } catch {
       // Raw stderr/paths may contain credentials or absolute locations: only a
       // fixed, friendly message is sent to the UI (details stay in the logs of
