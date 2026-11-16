@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -48,6 +49,43 @@ _SENSITIVE = re.compile(
     re.IGNORECASE,
 )
 _MAX_SEEN_IDS = 20_000
+# Rolling dialogue snapshot used only by the MBTI field-insight hook. It is
+# kept out of the memory database so finalize/watermark semantics stay intact.
+_MAX_DIALOGUE_TURNS = 200
+_MBTI_SERVICE_CLASS = None
+
+
+def _mbti_service_class():
+    """Load the insight service by path so import works from any cwd/sys.path."""
+    global _MBTI_SERVICE_CLASS
+    if _MBTI_SERVICE_CLASS is None:
+        module_path = Path(__file__).resolve().with_name("mbti_insight_service.py")
+        spec = importlib.util.spec_from_file_location(
+            "_qwaudio_mbti_insight_service", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load MBTI insight service module")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _MBTI_SERVICE_CLASS = module.MBTIInsightService
+    return _MBTI_SERVICE_CLASS
+
+
+def _dialogue_turn(speaker: Any, text: Any) -> Optional[Dict[str, Any]]:
+    """Normalize one line into the service's speaker_0 / external convention."""
+    content = _clean(text, 8_000)
+    if not content or _SENSITIVE.search(content):
+        return None
+    raw = str(speaker or "").strip().lower()
+    owner_labels = {
+        "speaker_0", "user", "human", "self", "me", "wearer", "owner",
+        "用户", "用户本人", "佩戴者", "本人", "我", "speaker_用户本人",
+    }
+    return {
+        "speaker": "speaker_0" if raw in owner_labels else "speaker_1",
+        "text": content,
+    }
 
 
 def _clean(value: Any, limit: int = 8_000) -> str:
@@ -109,6 +147,27 @@ class OwnerRuntime:
     seen_order: List[str] = field(default_factory=list)
     seen: set[str] = field(default_factory=set)
     active_ambient_recording_ids: set[str] = field(default_factory=set)
+    recent_dialogue: List[Dict[str, Any]] = field(default_factory=list)
+    recording_dialogue: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+
+    def remember_dialogue(
+        self,
+        turns: Iterable[Dict[str, Any]],
+        *,
+        recording_id: Optional[str] = None,
+    ) -> None:
+        """Buffer dialogue lines for the insight hook; bounded and non-persistent."""
+        collected = [turn for turn in turns if turn]
+        if not collected:
+            return
+        self.recent_dialogue.extend(collected)
+        if len(self.recent_dialogue) > _MAX_DIALOGUE_TURNS:
+            del self.recent_dialogue[:-_MAX_DIALOGUE_TURNS]
+        if recording_id:
+            bucket = self.recording_dialogue.setdefault(recording_id, [])
+            bucket.extend(collected)
+            if len(bucket) > _MAX_DIALOGUE_TURNS:
+                del bucket[:-_MAX_DIALOGUE_TURNS]
 
     def remember(self, keys: Iterable[str]) -> None:
         for key in keys:
@@ -152,6 +211,7 @@ class AgentMemoryRuntime:
         self._logging_config = dict(logging_config or {})
         self._logger = logger
         self._owners: Dict[str, OwnerRuntime] = {}
+        self._mbti_service = None  # Lazily created by _trigger_mbti_insight.
         self._operation_lock = threading.RLock()
         self._meeting_imports = FeishuMeetingImports(
             owner_directory=lambda owner: self._owner_dir / _owner_key(owner),
@@ -280,6 +340,27 @@ class AgentMemoryRuntime:
         self._owners[key] = created
         return created
 
+    def _trigger_mbti_insight(
+        self,
+        turns: List[Dict[str, Any]],
+        *,
+        source: str,
+    ) -> None:
+        """Fire the insight hook without ever blocking or breaking finalize."""
+        if not turns:
+            return
+        try:
+            service_class = _mbti_service_class()
+            if self._mbti_service is None:
+                self._mbti_service = service_class(logger=self._logger)
+            self._mbti_service.generate_insight_async(segments=turns, source=source)
+            self._logger.info(
+                "MBTI insight queued source=%s turns=%s", source, len(turns),
+            )
+        except Exception as exc:
+            # Insight is purely cosmetic; finalize must never fail because of it.
+            self._logger.debug("MBTI insight hook skipped: %s", exc)
+
     @staticmethod
     def _assistant_text_by_turn(messages: List[Dict[str, Any]]) -> Dict[str, str]:
         values: Dict[str, List[str]] = {}
@@ -303,6 +384,18 @@ class AgentMemoryRuntime:
         messages = [
             item for item in params.get("messages") or [] if isinstance(item, dict)
         ]
+        # Snapshot the just-spoken dialogue for the optional MBTI insight hook.
+        # This is independent of the memory dedupe/watermark path below.
+        dialogue_turns = []
+        for message in messages:
+            role = str(message.get("role") or "").strip().lower()
+            turn = _dialogue_turn(
+                "speaker_0" if role == "user" else "speaker_1",
+                message.get("content"),
+            )
+            if turn:
+                dialogue_turns.append(turn)
+        holder.remember_dialogue(dialogue_turns)
         assistants = self._assistant_text_by_turn(messages)
         # This flag denotes whether the system is recording ambient audio, not
         # whether this particular input is an ASR transcript.  The recorder
@@ -467,6 +560,14 @@ class AgentMemoryRuntime:
                 ],
             ]))
             transcript_segments.append(segment)
+        # Buffer the ASR lines for the recording-scoped MBTI insight hook.
+        # speaker_0 is the wearer per the field-insight convention.
+        dialogue_turns = []
+        for segment in transcript_segments:
+            turn = _dialogue_turn(segment.get("speaker"), segment.get("text"))
+            if turn:
+                dialogue_turns.append(turn)
+        holder.remember_dialogue(dialogue_turns, recording_id=recording_id)
         if transcript_segments:
             report = holder.pwm.accept_memory_input(
                 transcript_segments=transcript_segments,
@@ -533,6 +634,11 @@ class AgentMemoryRuntime:
             result["factFollowupDispatchQueued"],
             result["activeAmbientRecordingCount"],
         )
+        # Fire-and-forget: consume the buffered ASR lines for this recording.
+        recording_turns = holder.recording_dialogue.pop(recording_id, [])
+        self._trigger_mbti_insight(
+            recording_turns, source=f"ambient_recording:{recording_id}",
+        )
         return result
 
     def finalize(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -588,6 +694,14 @@ class AgentMemoryRuntime:
             result["factFollowupDispatchQueued"],
             (user_activity or {}).get("reason") or "",
         )
+        if boundary == "session_end":
+            # Snapshot and reset the rolling buffer; the insight thread owns
+            # its copy and never touches the memory DB or watermark state.
+            session_turns = list(holder.recent_dialogue)
+            holder.recent_dialogue.clear()
+            self._trigger_mbti_insight(
+                session_turns, source=f"session_end:{session_id}",
+            )
         return result
 
     def recall(self, params: Dict[str, Any]) -> Dict[str, Any]:
