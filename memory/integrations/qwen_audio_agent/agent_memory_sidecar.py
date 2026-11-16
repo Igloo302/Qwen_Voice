@@ -342,6 +342,7 @@ class AgentMemoryRuntime:
 
     def _trigger_mbti_insight(
         self,
+        holder: OwnerRuntime,
         turns: List[Dict[str, Any]],
         *,
         source: str,
@@ -353,7 +354,13 @@ class AgentMemoryRuntime:
             service_class = _mbti_service_class()
             if self._mbti_service is None:
                 self._mbti_service = service_class(logger=self._logger)
-            self._mbti_service.generate_insight_async(segments=turns, source=source)
+            # Reuse the owner's PWM language model so the insight uses exactly
+            # the same model/base_url/api_key/json_mode/thinking as memory.
+            self._mbti_service.generate_insight_async(
+                segments=turns,
+                source=source,
+                llm_client=holder.pwm.llm_client,
+            )
             self._logger.info(
                 "MBTI insight queued source=%s turns=%s", source, len(turns),
             )
@@ -637,7 +644,7 @@ class AgentMemoryRuntime:
         # Fire-and-forget: consume the buffered ASR lines for this recording.
         recording_turns = holder.recording_dialogue.pop(recording_id, [])
         self._trigger_mbti_insight(
-            recording_turns, source=f"ambient_recording:{recording_id}",
+            holder, recording_turns, source=f"ambient_recording:{recording_id}",
         )
         return result
 
@@ -700,7 +707,7 @@ class AgentMemoryRuntime:
             session_turns = list(holder.recent_dialogue)
             holder.recent_dialogue.clear()
             self._trigger_mbti_insight(
-                session_turns, source=f"session_end:{session_id}",
+                holder, session_turns, source=f"session_end:{session_id}",
             )
         return result
 

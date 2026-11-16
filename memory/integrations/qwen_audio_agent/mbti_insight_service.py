@@ -7,6 +7,11 @@ never modifies watermarks, and every public entry point swallows its own
 exceptions.  Long network calls run inside a daemon thread so the audio agent
 and the memory sidecar are never blocked.
 
+The language model is **always** the PWM ``LLMClient``.  Callers may inject one
+(the memory sidecar passes the owner's ``pwm.llm_client``); otherwise a default
+client is built from PWM's own config loader so the model, base_url, api_key,
+json_mode and thinking parameters are identical everywhere.
+
 CLI demo::
 
     memory/.venv/bin/python -m memory.integrations.qwen_audio_agent.mbti_insight_service --test
@@ -26,22 +31,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-try:  # requests ships with the project venv; fall back to stdlib if absent.
-    import requests
-except ImportError:  # pragma: no cover - only used in stripped environments
-    requests = None  # type: ignore[assignment]
+# ``LLMClient`` and the PWM config loader live in ``memory/src``.  The service
+# is loaded either as ``python -m memory.integrations...`` (repo root on
+# sys.path) or by path from the memory sidecar (which already adds this dir).
+# Make the import work in both cases without changing either caller.
+_SERVICE_ROOT = Path(__file__).resolve().parents[2]  # .../memory
+_SRC_ROOT = _SERVICE_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
 
-import urllib.error
-import urllib.request
+from config import split_memory_config  # noqa: E402
+from llm_client import LLMClient  # noqa: E402
 
 
-DEFAULT_CONFIG_PATH = Path("~/.config/qwaudio/config.env").expanduser()
+DEFAULT_ENV_PATH = Path("~/.config/qwaudio/config.env").expanduser()
+DEFAULT_PWM_CONFIG_PATH = _SERVICE_ROOT / "config.yaml"
 DEFAULT_OUTPUT_PATH = Path("~/.config/qwaudio/data/memory/mbti_insights.jsonl").expanduser()
-
-DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DASHSCOPE_MODEL = "qwen-plus"
-DEEPSEEK_MODEL = "deepseek-chat"
 
 _ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
@@ -55,6 +60,8 @@ _OWNER_SPEAKER_LABELS = {
 # speaker_1 (external voices in the field).
 _OWNER_LABEL = "speaker_0（佩戴者·你）"
 _EXTERNAL_LABEL = "speaker_1（外部发言人）"
+
+_LLM_STAGE = "mbti_field_insight"
 
 
 SYSTEM_PROMPT = """你是一位「随身荣格心理导师」，精通 MBTI 认知功能八维
@@ -92,30 +99,26 @@ class MBTIInsightService:
     def __init__(
         self,
         *,
-        config_path: Optional[Path | str] = None,
+        llm_client: Optional[LLMClient] = None,
         output_path: Optional[Path | str] = None,
+        config_path: Optional[Path | str] = None,
         logger: Optional[logging.Logger] = None,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        model: Optional[str] = None,
-        timeout: int = 60,
     ) -> None:
-        self._config_path = Path(config_path).expanduser() if config_path else DEFAULT_CONFIG_PATH
         self._output_path = Path(output_path).expanduser() if output_path else DEFAULT_OUTPUT_PATH
         self._logger = logger or logging.getLogger(__name__)
-        self._override_api_key = api_key
-        self._override_base_url = base_url
-        self._override_model = model
-        self._timeout = timeout
+        # PWM config.yaml used only when no LLMClient is injected.
+        self._config_path = Path(config_path).expanduser() if config_path else None
+        self._llm_client = llm_client
+        self._default_client: Optional[LLMClient] = None
+        self._client_lock = threading.Lock()
         self._io_lock = threading.Lock()
-        self._config_lock = threading.Lock()
-        self._cached_llm: Optional[Dict[str, str]] = None
 
     # ------------------------------------------------------------------
-    # Configuration
+    # Environment + configuration helpers (CLI convenience only)
     # ------------------------------------------------------------------
     @staticmethod
     def _read_env_file(path: Path) -> Dict[str, str]:
+        """Read ``KEY=VALUE`` lines; used only to mirror the desktop runtime env."""
         values: Dict[str, str] = {}
         try:
             text = path.read_text(encoding="utf-8")
@@ -131,51 +134,47 @@ class MBTIInsightService:
             values[key] = value
         return values
 
-    def _resolve_llm(self) -> Optional[Dict[str, str]]:
-        """DashScope/qwen-plus wins; DeepSeek is the documented fallback."""
-        with self._config_lock:
-            if self._cached_llm is not None:
-                return dict(self._cached_llm)
-            if self._override_api_key:
-                llm = {
-                    "api_key": self._override_api_key,
-                    "base_url": self._override_base_url or DASHSCOPE_BASE_URL,
-                    "model": self._override_model or DASHSCOPE_MODEL,
-                    "provider": "override",
-                }
-                self._cached_llm = llm
-                return dict(llm)
-            env = self._read_env_file(self._config_path)
-            dashscope = (
-                env.get("DASHSCOPE_API_KEY")
-                or os.environ.get("DASHSCOPE_API_KEY", "")
-            ).strip()
-            deepseek = (
-                env.get("DEEPSEEK_API_KEY")
-                or os.environ.get("DEEPSEEK_API_KEY", "")
-            ).strip()
-            if dashscope:
-                llm = {
-                    "api_key": dashscope,
-                    "base_url": env.get("DASHSCOPE_BASE_URL", "").strip() or DASHSCOPE_BASE_URL,
-                    "model": env.get("MBTI_INSIGHT_MODEL", "").strip() or DASHSCOPE_MODEL,
-                    "provider": "dashscope",
-                }
-            elif deepseek:
-                llm = {
-                    "api_key": deepseek,
-                    "base_url": env.get("DEEPSEEK_BASE_URL", "").strip() or DEEPSEEK_BASE_URL,
-                    "model": env.get("MBTI_INSIGHT_MODEL", "").strip() or DEEPSEEK_MODEL,
-                    "provider": "deepseek",
-                }
-            else:
-                self._logger.warning(
-                    "MBTI insight skipped: no DASHSCOPE_API_KEY/DEEPSEEK_API_KEY in %s or env",
-                    self._config_path,
-                )
-                return None
-            self._cached_llm = llm
-            return dict(llm)
+    @classmethod
+    def _apply_desktop_pwm_env(cls, path: Path = DEFAULT_ENV_PATH) -> None:
+        """Export desktop ``config.env`` values that PWM's loader consumes.
+
+        The desktop launches the sidecar with ``QWEN_AUDIO_PWM_*`` already
+        exported.  The standalone CLI mirrors that environment (without
+        overwriting anything already set) so the default ``LLMClient`` is
+        built from exactly the same inputs as the sidecar's.
+        """
+        for key, value in cls._read_env_file(path).items():
+            os.environ.setdefault(key, value)
+
+    def _default_pwm_client(self) -> Optional[LLMClient]:
+        """Build an LLMClient from PWM's own ``personal_world_model.llm_model``."""
+        with self._client_lock:
+            if self._default_client is None:
+                try:
+                    pwm_config = (
+                        split_memory_config(self._config_path)
+                        if self._config_path
+                        else split_memory_config()
+                    )
+                    self._default_client = LLMClient(
+                        memory_config={"llm": pwm_config.llm_model},
+                        logger=self._logger,
+                    )
+                except Exception as exc:
+                    self._logger.warning(
+                        "MBTI insight: failed to build default PWM LLMClient: %s", exc,
+                    )
+                    return None
+            return self._default_client
+
+    def _resolve_llm_client(
+        self, llm_client: Optional[LLMClient],
+    ) -> Optional[LLMClient]:
+        if llm_client is not None:
+            return llm_client
+        if self._llm_client is not None:
+            return self._llm_client
+        return self._default_pwm_client()
 
     # ------------------------------------------------------------------
     # Input normalization
@@ -234,10 +233,11 @@ class MBTIInsightService:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    # LLM
+    # LLM (PWM LLMClient only)
     # ------------------------------------------------------------------
     @staticmethod
     def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+        """Tolerant fallback parser for endpoints that ignore json mode."""
         raw = str(text or "").strip()
         fenced = _FENCE_RE.search(raw)
         if fenced:
@@ -251,62 +251,24 @@ class MBTIInsightService:
             return None
         return data if isinstance(data, dict) else None
 
-    @staticmethod
-    def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int):
-        """Use requests when available, otherwise stdlib urllib."""
-        if requests is not None:
-            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        body = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    def _call_llm(self, transcript: str, llm: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        url = f"{llm['base_url'].rstrip('/')}/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {llm['api_key']}",
-        }
-        base_payload: Dict[str, Any] = {
-            "model": llm["model"],
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "以下是刚结束的对白（speaker_0 是佩戴者本人，speaker_1 是外部发言人）。"
-                        "请按系统提示输出 JSON：\n\n" + transcript
-                    ),
-                },
-            ],
-            "temperature": 0.85,
-            "top_p": 0.9,
-            "max_tokens": 1200,
-            "stream": False,
-        }
-        # First try strict JSON mode; some endpoints reject response_format,
-        # in which case a plain call plus our tolerant parser still works.
-        attempts: List[Dict[str, Any]] = [
-            {**base_payload, "response_format": {"type": "json_object"}},
-            dict(base_payload),
-        ]
-        for index, payload in enumerate(attempts):
-            try:
-                data = self._post_json(url, headers, payload, self._timeout)
-                choices = data.get("choices") or []
-                content = (choices[0].get("message") or {}).get("content") if choices else None
-                parsed = self._extract_json(str(content or ""))
-                if parsed:
-                    return parsed
-                self._logger.warning("MBTI insight LLM attempt %s returned no JSON object", index + 1)
-            except Exception as exc:
-                self._logger.warning(
-                    "MBTI insight LLM attempt %s failed: %s: %s",
-                    index + 1, type(exc).__name__, str(exc)[:200],
-                )
-        return None
+    def _call_llm(self, transcript: str, llm_client: LLMClient) -> Optional[Dict[str, Any]]:
+        prompt = (
+            SYSTEM_PROMPT
+            + "\n\n---\n\n"
+            + "以下是刚结束的对白（speaker_0 是佩戴者本人，speaker_1 是外部发言人）。"
+            + "请严格按上面的系统指令，只输出一个 JSON 对象：\n\n"
+            + transcript
+        )
+        raw = llm_client.call_llm(prompt, stage_name=_LLM_STAGE)
+        if not raw:
+            self._logger.warning("MBTI insight LLM stage=%s returned no content", _LLM_STAGE)
+            return None
+        parsed = llm_client.parse_json_object_from_llm_text(raw, stage_name=_LLM_STAGE)
+        if parsed is None:
+            parsed = self._extract_json(raw)
+        if parsed is None:
+            self._logger.warning("MBTI insight LLM stage=%s returned no JSON object", _LLM_STAGE)
+        return parsed
 
     @staticmethod
     def _clean_fields(data: Dict[str, Any]) -> Dict[str, str]:
@@ -385,6 +347,7 @@ class MBTIInsightService:
         messages: Optional[List[Dict[str, Any]]] = None,
         segments: Optional[List[Dict[str, Any]]] = None,
         source: str = "unspecified",
+        llm_client: Optional[LLMClient] = None,
     ) -> Optional[Dict[str, Any]]:
         """Synchronously generate one insight. Catches every exception."""
         try:
@@ -392,10 +355,10 @@ class MBTIInsightService:
             if not turns:
                 self._logger.debug("MBTI insight skipped: no dialogue turns")
                 return None
-            llm = self._resolve_llm()
-            if not llm:
+            client = self._resolve_llm_client(llm_client)
+            if client is None:
                 return None
-            parsed = self._call_llm(self._format_transcript(turns), llm)
+            parsed = self._call_llm(self._format_transcript(turns), client)
             if not parsed:
                 return None
             record: Dict[str, Any] = self._clean_fields(parsed)
@@ -403,13 +366,14 @@ class MBTIInsightService:
                 "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "source": source,
                 "turn_count": len(turns),
-                "provider": llm.get("provider"),
-                "model": llm.get("model"),
+                "provider": "pwm_llm_client",
+                "model": getattr(client, "_model", None),
             })
             self._persist(record)
             self.notify(record)
             self._logger.info(
-                "MBTI insight generated source=%s archetype=%s", source, record["archetype"],
+                "MBTI insight generated source=%s archetype=%s stage=%s",
+                source, record["archetype"], _LLM_STAGE,
             )
             return record
         except Exception as exc:  # pragma: no cover - defensive boundary
@@ -422,11 +386,15 @@ class MBTIInsightService:
         messages: Optional[List[Dict[str, Any]]] = None,
         segments: Optional[List[Dict[str, Any]]] = None,
         source: str = "unspecified",
+        llm_client: Optional[LLMClient] = None,
     ) -> Optional[threading.Thread]:
         """Fire-and-forget. Returns the daemon thread (or None on failure)."""
         def runner() -> None:
             try:
-                self.generate_insight(messages=messages, segments=segments, source=source)
+                self.generate_insight(
+                    messages=messages, segments=segments, source=source,
+                    llm_client=llm_client,
+                )
             except Exception:  # pragma: no cover - belt and braces
                 self._logger.exception("MBTI insight async worker failed")
 
@@ -463,7 +431,10 @@ def _demo_segments() -> List[Dict[str, str]]:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="MBTI 场域洞察 · 测试入口")
     parser.add_argument("--test", action="store_true", help="用模拟会议对白生成一次真实洞察")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="config.env 路径")
+    parser.add_argument(
+        "--config", default=str(DEFAULT_PWM_CONFIG_PATH),
+        help="PWM config.yaml 路径（无注入 LLMClient 时用于构造默认客户端）",
+    )
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT_PATH), help="jsonl 持久化路径")
     args = parser.parse_args(argv)
 
@@ -475,6 +446,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.print_help()
         return 0
 
+    # Mirror the desktop's PWM environment so the default LLMClient matches
+    # the one the memory sidecar builds for each owner.
+    MBTIInsightService._apply_desktop_pwm_env(DEFAULT_ENV_PATH)
     service = MBTIInsightService(
         config_path=Path(args.config),
         output_path=Path(args.output),
@@ -484,11 +458,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     for turn in segments:
         label = "佩戴者" if turn["speaker"] == "speaker_0" else "外部"
         print(f"  [{label}] {turn['text']}")
-    print("\n正在请求 LLM 生成场域洞察 …\n")
+    print("\n正在请求 PWM LLMClient 生成场域洞察 …\n")
 
     result = service.generate_insight(segments=segments, source="cli-test")
     if not result:
-        print("未生成洞察：请检查 API Key、网络或日志输出。")
+        print("未生成洞察：请检查 PWM 配置/API Key、网络或日志输出。")
         return 1
     print("生成成功：")
     print(json.dumps(result, ensure_ascii=False, indent=2))
