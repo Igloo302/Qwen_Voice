@@ -129,12 +129,24 @@ const ACTIVITY_ROLE_LABELS = {
 }
 
 function CrystallizedAnchor({ context, loading, error, onRefresh }) {
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(false)
   const latest = context?.latest_activity || {}
   const activities = context?.recent_activities || []
   const threads = context?.active_threads || []
   const states = context?.situational_states || []
   const hasContent = Boolean(latest.activity_text || threads.length || states.length)
+
+  const summaryParts = []
+  if (latest.activity_text) {
+    summaryParts.push(latest.activity_text.slice(0, 26) + (latest.activity_text.length > 26 ? '…' : ''))
+  }
+  if (threads.length) {
+    summaryParts.push(`${threads.length} 条主线`)
+  }
+  if (states.length) {
+    summaryParts.push(states[0].state_topic || '当前焦点')
+  }
+  const summaryText = summaryParts.join(' ｜ ')
 
   return <section className={`crystal-anchor ${open ? 'open' : ''}`}>
     <header className="crystal-anchor-head">
@@ -147,9 +159,13 @@ function CrystallizedAnchor({ context, loading, error, onRefresh }) {
         <span className="crystal-icon">🧠</span>
         <span className="crystal-title">
           <b>{t('个人世界模型认知基底')}</b>
-          <small>CRYSTALLIZED MEMORY ANCHOR · {t('五层记忆蒸馏金字塔的高维产物')}</small>
+          <small>
+            {open
+              ? `CRYSTALLIZED MEMORY ANCHOR · ${t('五层记忆蒸馏金字塔的高维产物')}`
+              : (summaryText ? `${t('认知底座就绪')}：${summaryText}` : t('五层记忆蒸馏金字塔的高维产物'))}
+          </small>
         </span>
-        <span className="crystal-chevron">{open ? '▾' : '▸'}</span>
+        <span className="crystal-chevron">{open ? '▾ 收起' : '▸ 展开基底'}</span>
       </button>
       <button type="button" className="devlab-button" onClick={onRefresh} disabled={loading}>
         {loading ? t('读取中…') : `↻ ${t('刷新基底')}`}
@@ -648,9 +664,18 @@ export default function DevLabCenter() {
       <div className="devlab-status"><i />{t('GATEWAY LOCAL · SIDECAR READY')}</div>
     </header>
 
-    <nav className="devlab-tabs" aria-label={t('调试面板导航')}>
+    <CrystallizedAnchor
+      context={crystallized}
+      loading={crystallizedLoading}
+      error={crystallizedError}
+      onRefresh={() => void loadCrystallized()}
+    />
+
+    <nav className="devlab-tabs" role="tablist" aria-label={t('调试面板导航')}>
       {TABS.map(tab => <button
         type="button"
+        role="tab"
+        aria-selected={activeTab === tab.id}
         key={tab.id}
         className={activeTab === tab.id ? 'active' : ''}
         onClick={() => setActiveTab(tab.id)}
@@ -659,13 +684,6 @@ export default function DevLabCenter() {
         <span className="tab-text"><b>{t(tab.label)}</b><small>{tab.sub}</small></span>
       </button>)}
     </nav>
-
-    <CrystallizedAnchor
-      context={crystallized}
-      loading={crystallizedLoading}
-      error={crystallizedError}
-      onRefresh={() => void loadCrystallized()}
-    />
 
     {notice && <div className="devlab-toast" role="status">✦ {notice}</div>}
     {simulateError && activeTab !== 'events' && <div className="devlab-alert" role="alert">⚠ {simulateError}</div>}
