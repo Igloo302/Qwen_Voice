@@ -2078,12 +2078,8 @@ export function attachRealtimeGateway(server, {
         event.type === GatewayClientEvent.TEXT_MESSAGE
         || event.type === GatewayClientEvent.INPUT_MESSAGE
       ) {
-        if (sleeping || waking) {
-          send(ws, {
-            type: 'error',
-            message: '当前客户端已休眠，请先唤醒后再继续。',
-          })
-          return
+        if (sleeping) {
+          wakeFromSleep({ wakeReason: 'text_input' })
         }
         wakeWordGraceActive = false
         sleepController.recordActivity()

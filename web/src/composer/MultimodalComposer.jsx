@@ -73,7 +73,7 @@ export default function MultimodalComposer({
       ...attachments.map(item => item.part),
     ])
     if (!onSend(parts)) {
-      setError(t('Gateway 尚未连接'))
+      setError(connectionState === 'disconnected' ? t('Gateway 尚未连接') : t('发送失败，请重试'))
       return
     }
     setText('')

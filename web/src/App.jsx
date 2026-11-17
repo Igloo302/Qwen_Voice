@@ -322,10 +322,14 @@ export default function App() {
       const result = await bridge.setSurface(mode)
       setDesktopSurfaceMode(result?.mode === 'panel' ? 'panel' : 'orb')
       noteInteraction()
+      if (result?.mode === 'panel' && desktopLifecycle !== 'active') {
+        setDesktopLifecycle('active')
+        gatewayCommandsRef.current?.wake({ wakeReason: 'panel_opened' })
+      }
     } catch {
       // A rejected host transition leaves the current presentation intact.
     }
-  }, [noteInteraction])
+  }, [desktopLifecycle, noteInteraction])
 
   const triggerSpriteAnimation = useCallback((eventName, { priority = false } = {}) => {
     if (!desktopOrbMode || isBuiltinOrbSkin(orbSkinId)) return
@@ -1285,8 +1289,8 @@ export default function App() {
 
   const sendComposerInput = parts => {
     if (desktopOrbMode && desktopLifecycle !== 'active') {
-      setActivity(t('待唤醒，说“你好，千问”开始对话'))
-      return false
+      setDesktopLifecycle('active')
+      voice.wake({ wakeReason: 'manual_input' })
     }
     // Sending is a browser user gesture, so it is also the earliest reliable
     // point to unlock audio playback while the microphone remains muted.
