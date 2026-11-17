@@ -459,19 +459,18 @@ export default function App() {
           url: payload.backend?.uiPath || payload.backend?.baseUrl || '',
         })
         setActivity(response.ok ? t('Gateway 已连接') : t('能力服务尚未连接'))
-        if (desktopOrbMode) {
-          const backendSettled = !backendEnabled || [
-            'ready',
-            'failed',
-          ].includes(backendPayload.status)
-          refreshTimer = setTimeout(refresh, backendSettled ? 3000 : 500)
-        }
+        const backendSettled = !backendEnabled || [
+          'ready',
+          'failed',
+        ].includes(backendPayload.status)
+        const pollMs = desktopOrbMode ? (backendSettled ? 3000 : 500) : 5000
+        refreshTimer = setTimeout(refresh, pollMs)
       })
       .catch(() => {
         if (cancelled) return
         setGatewayRuntime('failed')
         setActivity(t('qwen-audio-agent Gateway 尚未连接'))
-        if (desktopOrbMode) refreshTimer = setTimeout(refresh, 1000)
+        refreshTimer = setTimeout(refresh, 1500)
       })
     refresh()
     return () => {
