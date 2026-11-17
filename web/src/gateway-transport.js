@@ -59,9 +59,22 @@ export function gatewayTransportIsRemote(locationValue = globalThis.location) {
   }
 }
 
-export function gatewayHttpUrl(path) {
-  if (!runtime.gatewayUrl) return path
-  return new URL(String(path).replace(/^\//, ''), `${runtime.gatewayUrl}/`).toString()
+export function gatewayHttpUrl(path, locationValue = globalThis.location) {
+  if (runtime.gatewayUrl) {
+    return new URL(String(path).replace(/^\//, ''), `${runtime.gatewayUrl}/`).toString()
+  }
+  const cleanPath = String(path).replace(/^\//, '')
+  if (!locationValue?.href) return cleanPath
+  try {
+    const base = new URL(locationValue.href)
+    if (base.pathname && base.pathname !== '/') {
+      const basePath = base.pathname.endsWith('/')
+        ? base.pathname
+        : base.pathname.replace(/[^/]*$/, '')
+      return `${basePath}${cleanPath}`
+    }
+  } catch {}
+  return cleanPath
 }
 
 export function gatewayFetch(path, init = {}, fetchImpl = globalThis.fetch) {

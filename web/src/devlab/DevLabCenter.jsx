@@ -53,7 +53,8 @@ const SCENARIOS = [
 const AMBIENT_POLL_MS = 10_000
 
 async function readJson(path, options = {}, signal) {
-  const response = await gatewayFetch(path, { cache: 'no-store', ...options, signal })
+  const cleanPath = String(path).replace(/^\//, '')
+  const response = await gatewayFetch(cleanPath, { cache: 'no-store', ...options, signal })
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
     throw new Error(
@@ -504,7 +505,7 @@ export default function DevLabCenter() {
     setInsightsLoading(true)
     setInsightsError('')
     try {
-      const payload = await readJson('/api/devlab/insights', {}, signal)
+      const payload = await readJson('api/devlab/insights', {}, signal)
       if (signal?.aborted) return
       setInsights(Array.isArray(payload.items) ? payload.items : [])
     } catch (error) {
@@ -518,7 +519,7 @@ export default function DevLabCenter() {
     setSparksLoading(true)
     setSparksError('')
     try {
-      const payload = await readJson('/api/devlab/sparks', {}, signal)
+      const payload = await readJson('api/devlab/sparks', {}, signal)
       if (signal?.aborted) return
       setSparks(Array.isArray(payload.items) ? payload.items : [])
     } catch (error) {
@@ -532,7 +533,7 @@ export default function DevLabCenter() {
     setAmbientLoading(true)
     setAmbientError('')
     try {
-      const payload = await readJson('/api/devlab/ambient-recordings', {}, signal)
+      const payload = await readJson('api/devlab/ambient-recordings', {}, signal)
       if (signal?.aborted) return
       setRecordings(Array.isArray(payload.items) ? payload.items : [])
     } catch (error) {
@@ -546,7 +547,7 @@ export default function DevLabCenter() {
     setCrystallizedLoading(true)
     setCrystallizedError('')
     try {
-      const payload = await readJson('/api/devlab/crystallized-context', {}, signal)
+      const payload = await readJson('api/devlab/crystallized-context', {}, signal)
       if (signal?.aborted) return
       setCrystallized(payload.crystallized_context || payload)
     } catch (error) {
@@ -584,7 +585,7 @@ export default function DevLabCenter() {
     else setInsightEval(null)
     try {
       if (isSpark) {
-        const payload = await readJson('/api/devlab/sparks/simulate', {
+        const payload = await readJson('api/devlab/sparks/simulate', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(isPreset ? { mode: 'preset', preset } : { mode: 'real' }),
@@ -608,7 +609,7 @@ export default function DevLabCenter() {
         setActiveTab('sparks')
         return
       }
-      const payload = await readJson('/api/devlab/insights/simulate', {
+      const payload = await readJson('api/devlab/insights/simulate', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(isPreset ? { mode: 'preset', preset } : { mode: 'real' }),

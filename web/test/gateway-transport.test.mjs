@@ -15,6 +15,18 @@ test.afterEach(() => configureGatewayTransport())
 test('keeps the existing same-origin browser transport by default', () => {
   assert.equal(gatewayHttpUrl('api/health'), 'api/health')
   assert.equal(
+    gatewayHttpUrl('/api/health', new URL('http://127.0.0.1:3101/')),
+    'api/health',
+  )
+  assert.equal(
+    gatewayHttpUrl('api/devlab/insights', new URL('http://127.0.0.1:54321/render-token-123/?view=debug')),
+    '/render-token-123/api/devlab/insights',
+  )
+  assert.equal(
+    gatewayHttpUrl('/api/devlab/insights', new URL('http://127.0.0.1:54321/render-token-123/?view=debug')),
+    '/render-token-123/api/devlab/insights',
+  )
+  assert.equal(
     gatewayRealtimeUrl('voice one', new URL('https://example.test/app/index.html')),
     'wss://example.test/app/api/realtime?sessionId=voice%20one',
   )
