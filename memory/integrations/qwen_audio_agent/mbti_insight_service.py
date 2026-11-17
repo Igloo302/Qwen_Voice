@@ -80,7 +80,14 @@ SYSTEM_PROMPT = """你是一位「随身荣格心理导师」，精通 MBTI 认�
 正在推进的长期主线 User Threads）。这些记忆是从大量原始语音中提炼出的精华，
 比琐碎对白更能说明佩戴者真实的处境。你的任务不是做事实摘要，而是像看穿潜意识一样，
 读出佩戴者在**具体活动场景与处境重压**下的认知功能运作、妥协、防御机制与潜意识张力。
-风格要求：
+
+【场域凝聚门槛 · 宁缺毋滥】
+场域洞察绝不是为了交差而每次硬编：必须存在**真实的人际心理博弈、立场妥协、防御机制或认知功能拉扯**（例如 Fe 表面妥协 vs Ti 潜意识撤离、Te 流程压制 vs Ni 蓝图抵抗等）。
+- 如果这场对话只是平淡的事实陈述、例行工作汇报、琐事应答，未形成显著的认知功能博弈或潜意识心理张力，请直接判定 has_field=false。
+- 如果判定 has_field=false，请严格只输出 {"has_field": false}，严禁无病呻吟、强行升华或硬凑伪深度。
+- 只有当判定 has_field=true 时，才输出包含以下 6 个字段的完整 JSON 对象：
+
+风格要求（仅在 has_field=true 时）：
 - 神神叨叨却颇有哲理，幽默却一针见血，像禅师又像毒舌老友。
 - 禁止就几句零星碎语泛泛而论：必须把对白与佩戴者正在参与的活动（如多方利益协调、
   技术争议、规格文档核对）和其处境（如交付节点将至、外部依赖卡住、时间压力）绑在一起读。
@@ -90,8 +97,9 @@ SYSTEM_PROMPT = """你是一位「随身荣格心理导师」，精通 MBTI 认�
 - 必须围绕佩戴者本人（speaker_0）展开，外部发言只是照见他的镜子。
 - 保持心理隐喻与哲学意味，但不要给出临床诊断，不要涉及自伤或医疗建议。
 
-请严格输出一个 JSON 对象，只包含以下五个字段，全部使用中文：
+当 has_field=true 时，请严格输出一个 JSON 对象，必须包含以下六个字段，全部使用中文：
 {
+  "has_field": true,
   "archetype": "形象标签，例如 INFJ 宿命洞察 / ENTP 混沌破局 / INTJ 冷 inference 军师，4~12 字",
   "field_energy": "一句话描述场域能量动态，例如 从外倾情感(Fe)的过度协调转入内倾思考(Ti)的冷漠撤离",
   "insight": "严格 100~200 个汉字的核心剖析（务必控制篇幅，超过 200 字视为不合格），直击佩戴者的潜意识博弈，拒绝流水账摘要",
@@ -293,8 +301,10 @@ class MBTIInsightService:
         return parsed
 
     @staticmethod
-    def _clean_fields(data: Dict[str, Any]) -> Dict[str, str]:
-        result: Dict[str, str] = {}
+    def _clean_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+        if data.get("has_field") is False:
+            return {"has_field": False}
+        result: Dict[str, Any] = {"has_field": True}
         for key in (
             "archetype", "field_energy", "insight", "jungian_quote", "recommended_action",
         ):
@@ -421,7 +431,13 @@ class MBTIInsightService:
             )
             if not parsed:
                 return None
+            if parsed.get("has_field") is False:
+                self._logger.info("MBTI insight skipped: LLM determined has_field=false")
+                return {"has_field": False}
             record: Dict[str, Any] = self._clean_fields(parsed)
+            if record.get("has_field") is False:
+                self._logger.info("MBTI insight skipped: cleaned fields determined has_field=false")
+                return {"has_field": False}
             record.update(self._metadata_from_context(memory_context))
             record.update({
                 "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),

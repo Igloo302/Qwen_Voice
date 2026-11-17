@@ -318,6 +318,16 @@
   background: linear-gradient(120deg, rgba(130, 132, 138, 0.13), rgba(255, 255, 255, 0.02));
 }
 
+.devlab-rule-banner.no-change {
+  border-color: rgba(200, 165, 91, 0.32);
+  background: linear-gradient(120deg, rgba(200, 165, 91, 0.12), rgba(255, 255, 255, 0.02));
+}
+
+.devlab-rule-banner.no-field {
+  border-color: rgba(87, 215, 196, 0.28);
+  background: linear-gradient(120deg, rgba(87, 215, 196, 0.12), rgba(200, 165, 91, 0.03));
+}
+
 .rule-banner-icon {
   flex: none;
   font-size: 22px;

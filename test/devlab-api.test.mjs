@@ -446,7 +446,12 @@ test('insights simulate in real mode feeds extracted turns to Python and flags p
     recordingsDir,
     simulate: async payload => {
       observed.push(payload)
-      appendFileSync(insightsPath, insight('真实场域原型', '2026-05-02T00:00:00+08:00') + '\n')
+      appendFileSync(insightsPath, JSON.stringify({
+        archetype: '真实场域原型',
+        source: payload.source,
+        activity_id: payload.memoryContext?.latest_activity?.id,
+        created_at: '2026-05-02T00:00:00+08:00',
+      }) + '\n')
       return { archetype: '真实场域原型', turn_count: payload.segments.length }
     },
   })
@@ -465,6 +470,61 @@ test('insights simulate in real mode feeds extracted turns to Python and flags p
   assert.equal(res.body.insight.crystallized_context.active_threads.length, 2)
   assert.equal(res.body.crystallizedContext.active_threads[0].title, '空间屏应用与Device SDK交付')
   assert.equal(res.body.items[0].archetype, '真实场域原型')
+
+  // Second call with same files and same activity state must be deduplicated
+  const resRepeat = fakeRes()
+  await app.routes.get('POST /api/devlab/insights/simulate')({ body: { mode: 'real' } }, resRepeat)
+  assert.equal(resRepeat.statusCode, 200)
+  assert.equal(resRepeat.body.success, false)
+  assert.equal(resRepeat.body.has_field, false)
+  assert.equal(resRepeat.body.reason, 'already_analyzed')
+  assert.match(resRepeat.body.message, /避免重复生成/)
+  assert.equal(observed.length, 1) // LLM was not called a second time
+})
+
+test('insights simulate in real mode requires bilateral interaction', async t => {
+  const { insightsPath, recordingsDir } = fixture(t)
+  writeAsr(recordingsDir, 'monologue.asr.json', [
+    { speaker: 'user', text: '我今天一个人自言自语了很久，思考未来的产品路线。' },
+    { speaker: 'speaker_0', text: '但这其实没有任何其他人参与，只是自己的碎碎念。' },
+  ], 1)
+  const app = fakeApp()
+  registerDevLabRoutes(app, {
+    crystallizedContextLoader: async () => CRYSTALLIZED_STUB,
+    insightsPath,
+    recordingsDir,
+    simulate: async () => { throw new Error('should not be called for monologue') },
+  })
+
+  const res = fakeRes()
+  await app.routes.get('POST /api/devlab/insights/simulate')({ body: { mode: 'real' } }, res)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.body.success, false)
+  assert.equal(res.body.reason, 'no_interpersonal_field')
+  assert.match(res.body.message, /多方博弈/)
+})
+
+test('insights simulate handles flat_field from model gatekeeper', async t => {
+  const { insightsPath, recordingsDir } = fixture(t)
+  writeAsr(recordingsDir, 'polite.asr.json', [
+    { speaker: 'speaker_1', text: '明天上午十点开项目进度对齐例会，请大家准时参加。' },
+    { speaker: 'speaker_0', text: '收到，已同步到工作日历，明天准时到达会议室。' },
+  ], 1)
+  const app = fakeApp()
+  registerDevLabRoutes(app, {
+    crystallizedContextLoader: async () => CRYSTALLIZED_STUB,
+    insightsPath,
+    recordingsDir,
+    simulate: async () => ({ has_field: false }),
+  })
+
+  const res = fakeRes()
+  await app.routes.get('POST /api/devlab/insights/simulate')({ body: { mode: 'real' } }, res)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.body.success, true)
+  assert.equal(res.body.has_field, false)
+  assert.equal(res.body.reason, 'flat_field')
+  assert.match(res.body.message, /较为平缓/)
 })
 
 test('sparks simulate defaults to real mode and reports no_voice with no transcript', async t => {

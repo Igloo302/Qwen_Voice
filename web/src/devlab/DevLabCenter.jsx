@@ -610,11 +610,21 @@ export default function DevLabCenter() {
         if (Array.isArray(payload.items)) setSparks(payload.items)
         if (payload.has_spark === false || payload.reason) {
           setSparkEval({
-            tone: payload.reason === 'no_voice' ? 'no-voice' : 'no-spark',
-            icon: payload.reason === 'no_voice' ? '🎙️' : '🫧',
-            title: payload.reason === 'no_voice'
+            tone: payload.reason === 'no_voice'
+              ? 'no-voice'
+              : payload.reason === 'already_analyzed'
+                ? 'no-change'
+                : 'no-spark',
+            icon: payload.reason === 'no_voice'
+              ? '🎙️'
+              : payload.reason === 'already_analyzed'
+                ? '🔁'
+                : '🫧',
+            title: payload.title || (payload.reason === 'no_voice'
               ? t('规则判定 · 无有效语音')
-              : t('规则判定 · 无灵感火花'),
+              : payload.reason === 'already_analyzed'
+                ? t('规则判定 · 暂无新录音')
+                : t('规则判定 · 无灵感火花')),
             message: payload.message || t('佩戴者未提出新颖创意或假设，未触发灵感打扰。'),
             stats: payload.stats,
             sourceFiles: payload.sourceFiles,
@@ -632,12 +642,30 @@ export default function DevLabCenter() {
       })
       if (payload.crystallizedContext) setCrystallized(payload.crystallizedContext)
       if (Array.isArray(payload.items)) setInsights(payload.items)
-      if (payload.success === false || payload.reason === 'insufficient_dialogue') {
+      if (payload.success === false || payload.has_field === false || payload.reason) {
         setInsightEval({
-          tone: 'insufficient',
-          icon: '🧊',
-          title: t('规则判定 · 未生成洞察'),
-          message: payload.message || t('有效对白不足以凝聚场域，未触发洞察打扰。'),
+          tone: payload.reason === 'already_analyzed'
+            ? 'no-change'
+            : payload.reason === 'flat_field'
+              ? 'no-field'
+              : 'insufficient',
+          icon: payload.reason === 'already_analyzed'
+            ? '🔁'
+            : payload.reason === 'flat_field'
+              ? '🌊'
+              : payload.reason === 'no_interpersonal_field'
+                ? '👤'
+                : '🧊',
+          title: payload.title || (
+            payload.reason === 'already_analyzed'
+              ? t('规则判定 · 暂无新录音')
+              : payload.reason === 'flat_field'
+                ? t('规则判定 · 场域平淡无张力')
+                : payload.reason === 'no_interpersonal_field'
+                  ? t('规则判定 · 缺乏人际博弈')
+                  : t('规则判定 · 未生成洞察')
+          ),
+          message: payload.message || t('未触发洞察打扰。'),
           stats: payload.stats,
           sourceFiles: payload.sourceFiles,
         })

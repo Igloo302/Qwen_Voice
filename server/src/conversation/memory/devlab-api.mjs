@@ -267,7 +267,7 @@ function normalizeInsight(record) {
     recommended_action: clean(record.recommended_action, 400),
     created_at: clean(record.created_at, 60),
     model: clean(record.model, 120),
-    source: clean(record.source, 1_000),
+    source: clean(record.source, 4_000),
     provider: clean(record.provider, 80),
     activity_id: record.activity_id ?? null,
     activity_summary: clean(record.activity_summary, 1_000),
@@ -320,7 +320,7 @@ function normalizeSpark(record) {
     reality_check: clean(record.reality_check, 1_000),
     created_at: clean(record.created_at, 60),
     model: clean(record.model, 120),
-    source: clean(record.source, 1_000),
+    source: clean(record.source, 4_000),
     provider: clean(record.provider, 80),
     linked_thread_titles: Array.isArray(record.linked_thread_titles)
       ? record.linked_thread_titles.map(name => clean(name, 200))
@@ -559,7 +559,7 @@ function createInlinePythonSimulator(script, options, { optionsKey, payloadKey, 
     const payload = {
       segments,
       messages,
-      source: clean(source, 80) || 'devlab_simulate',
+      source: clean(source, 4_000) || 'devlab_simulate',
       [payloadKey]: options[optionsKey] || defaultPath,
       configPath: options.configPath || '',
     }
@@ -766,19 +766,77 @@ export function registerDevLabRoutes(app, options = {}) {
         real.totalChars < MIN_REAL_DIALOGUE_CHARS
         || real.totalTurns < MIN_REAL_DIALOGUE_TURNS
       ) {
+        let items = []
+        try { items = readInsights(insightsPath, insightLimit) } catch {}
         return res.json({
           success: false,
           evaluated: true,
+          has_field: false,
           reason: 'insufficient_dialogue',
+          title: '规则判定 · 有效对白不足',
           message: '最近真实录音有效字数不足 30 字（仅检测到零星应答），未能凝聚出有效的人际博弈场域，规则判定不生成洞察。',
           sourceFiles: real.fileNames,
           stats,
+          items,
         })
       }
-      const source = buildRealSource(real.fileNames)
+
+      // Interpersonal gatekeeper: a field requires bilateral interaction.
+      const hasOwner = real.turns.some(t => t.speaker === 'speaker_0')
+      const hasExternal = real.turns.some(t => t.speaker !== 'speaker_0')
+      if (!hasOwner || !hasExternal) {
+        let items = []
+        try { items = readInsights(insightsPath, insightLimit) } catch {}
+        return res.json({
+          success: false,
+          evaluated: true,
+          has_field: false,
+          reason: 'no_interpersonal_field',
+          title: '规则判定 · 缺乏人际博弈',
+          message: '最近录音仅检测到单方发言，未检测到佩戴者与外部的多方博弈与立场碰撞，未能凝聚人际场域，规则判定不生成洞察。',
+          sourceFiles: real.fileNames,
+          stats,
+          items,
+        })
+      }
+
       // Anchor the reading in the distilled world-model pyramid (activities,
       // threads, situational states) instead of raw ASR noise alone.
       const crystallized_context = normalizeCrystallizedContext(await loadCrystallized())
+
+      // Deduplication gatekeeper: do not produce duplicate insight cards when
+      // clicking repeatedly on the exact same recorded files and activity state.
+      let existingInsights = []
+      try { existingInsights = readInsights(insightsPath, insightLimit) } catch {}
+      const latestRealInsight = existingInsights.find(item => (
+        item.is_real_data || (Array.isArray(item.source_files) && item.source_files.length > 0)
+      ))
+      if (latestRealInsight && Array.isArray(latestRealInsight.source_files) && latestRealInsight.source_files.length > 0) {
+        const currentFileSet = new Set(real.fileNames)
+        const prevFileSet = new Set(latestRealInsight.source_files)
+        const isSameFiles = currentFileSet.size > 0
+          && currentFileSet.size === prevFileSet.size
+          && [...currentFileSet].every(f => prevFileSet.has(f))
+        const currentActId = crystallized_context?.latest_activity?.id
+        const isSameActivity = !currentActId
+          || !latestRealInsight.activity_id
+          || currentActId === latestRealInsight.activity_id
+        if (isSameFiles && isSameActivity) {
+          return res.json({
+            success: false,
+            evaluated: true,
+            has_field: false,
+            reason: 'already_analyzed',
+            title: '规则判定 · 暂无新录音或场域变化',
+            message: `最近这批真实录音已提炼过场域洞察（对应原型：${latestRealInsight.archetype || '未命名'}），暂无新录音输入或活动演进，避免重复生成。`,
+            sourceFiles: real.fileNames,
+            stats,
+            items: existingInsights,
+          })
+        }
+      }
+
+      const source = buildRealSource(real.fileNames)
       try {
         const raw = await simulate({
           segments: real.turns,
@@ -788,6 +846,21 @@ export function registerDevLabRoutes(app, options = {}) {
           memoryContext: crystallized_context,
         })
         if (!raw) return res.status(502).json({ code: 'devlab_simulation_empty' })
+
+        // Model-level gatekeeper: the field has no significant cognitive tension.
+        if (raw.has_field === false) {
+          return res.json({
+            success: true,
+            evaluated: true,
+            has_field: false,
+            reason: 'flat_field',
+            title: '规则判定 · 场域平稳无张力',
+            message: '已深度扫描最近真实对白与活动：当前人际博弈与认知功能运作较为平缓，未检测到显著的心理防御或功能妥协张力，保持静默。',
+            sourceFiles: real.fileNames,
+            stats,
+            items: existingInsights,
+          })
+        }
         const insight = {
           ...raw,
           is_real_data: true,
@@ -874,6 +947,35 @@ export function registerDevLabRoutes(app, options = {}) {
       const source = buildRealSource(real.fileNames)
       // Anchor the critique in the wearer's real project threads / focus.
       const crystallized_context = normalizeCrystallizedContext(await loadCrystallized())
+
+      // Deduplication gatekeeper for sparks: avoid duplicate capture when
+      // clicking repeatedly on the exact same recorded files.
+      let existingSparks = []
+      try { existingSparks = readSparks(sparksPath, insightLimit) } catch {}
+      const latestRealSpark = existingSparks.find(item => (
+        item.is_real_data || (Array.isArray(item.source_files) && item.source_files.length > 0)
+      ))
+      if (latestRealSpark && Array.isArray(latestRealSpark.source_files) && latestRealSpark.source_files.length > 0) {
+        const currentFileSet = new Set(real.fileNames)
+        const prevFileSet = new Set(latestRealSpark.source_files)
+        const isSameFiles = currentFileSet.size > 0
+          && currentFileSet.size === prevFileSet.size
+          && [...currentFileSet].every(f => prevFileSet.has(f))
+        if (isSameFiles && latestRealSpark.has_spark) {
+          return res.json({
+            success: false,
+            evaluated: true,
+            has_spark: false,
+            reason: 'already_analyzed',
+            title: '规则判定 · 暂无新录音',
+            message: `最近这批真实录音已提炼过灵感火花（对应灵感：${latestRealSpark.title || '未命名'}），暂无新录音输入，避免重复捕获。`,
+            sourceFiles: real.fileNames,
+            stats,
+            items: existingSparks,
+          })
+        }
+      }
+
       try {
         const raw = await sparkSimulate({
           segments: real.turns,
