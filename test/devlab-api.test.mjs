@@ -12,6 +12,7 @@ import {
   extractRecentRealDialogue,
   normalizeCrystallizedContext,
   readAmbientRecordings,
+  readAmbientStatus,
   readInsights,
   readSparks,
   registerDevLabRoutes,
@@ -603,4 +604,86 @@ test('sparks simulate in real mode flags a genuine spark with provenance', async
   assert.equal(res.body.spark.is_real_data, true)
   assert.deepEqual(res.body.spark.source_files, ['idea.asr.json'])
   assert.equal(res.body.spark.crystallized_context.situational_states.length, 1)
+})
+
+test('readAmbientStatus reports fallback when directory is empty or missing', async t => {
+  const { root } = fixture(t)
+  const status = readAmbientStatus(join(root, 'non-existent'))
+  assert.equal(status.recordingActive, false)
+  assert.equal(status.queue.pendingCount, 0)
+  assert.equal(status.queue.completedCount, 0)
+  assert.equal(status.latestTranscript, null)
+  assert.match(status.summary.recordingText, /未开启录音/)
+})
+
+test('readAmbientStatus detects active recording, session manifest and asr queue', async t => {
+  const { recordingsDir, sparksPath } = fixture(t)
+  mkdirSync(recordingsDir, { recursive: true })
+
+  // 1. Write an active partial wav
+  writeFileSync(join(recordingsDir, '20261119_110000_mic.partial.wav'), 'RIFF...')
+
+  // 2. Write a session manifest with transcripts queue
+  const manifest = {
+    recording_id: '20261119_110000_test12',
+    started_at: '2026-11-19T03:00:00.000Z',
+    tracks: {
+      microphone: { name: 'Built-in Mic' },
+      system: { name: 'BlackHole' },
+    },
+    transcripts: [
+      {
+        audioFile: 'batch_001.wav',
+        transcriptFile: 'batch_001.asr.json',
+        source: 'microphone',
+        batchIndex: 1,
+        asrStatus: 'completed',
+        transcriptSegmentCount: 0,
+      },
+      {
+        audioFile: 'batch_002.wav',
+        transcriptFile: 'batch_002.asr.json',
+        source: 'system',
+        batchIndex: 2,
+        asrStatus: 'pending',
+      },
+    ],
+  }
+  writeFileSync(join(recordingsDir, '20261119_110000_test12.json'), JSON.stringify(manifest))
+
+  // 3. Write completed asr file
+  writeFileSync(join(recordingsDir, 'batch_001.asr.json'), JSON.stringify({
+    batchId: 'batch_001',
+    source: 'microphone',
+    speechSegmentCount: 0,
+    durationSeconds: 600,
+    segments: [],
+  }))
+
+  const status = readAmbientStatus(recordingsDir)
+  assert.equal(status.recordingActive, true)
+  assert.equal(status.recordingId, '20261119_110000_test12')
+  assert.equal(status.queue.completedCount, 1)
+  assert.equal(status.queue.pendingCount, 1)
+  assert.equal(status.queue.currentTranscribing?.source, 'system')
+  assert.equal(status.queue.currentTranscribing?.batchIndex, 2)
+  assert.equal(status.latestTranscript?.hasSpeech, false)
+  assert.match(status.summary.recordingText, /持续录音中/)
+  assert.match(status.summary.asrText, /系统音频 #2/)
+
+  // 4. Verify route GET /api/devlab/ambient-recordings returns both status and items
+  const app = fakeApp()
+  registerDevLabRoutes(app, {
+    crystallizedContextLoader: async () => CRYSTALLIZED_STUB,
+    sparksPath,
+    recordingsDir,
+  })
+
+  const res = fakeRes()
+  await app.routes.get('GET /api/devlab/ambient-recordings')({ query: {} }, res)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.body.success, true)
+  assert.equal(res.body.status.recordingActive, true)
+  assert.equal(res.body.total, 1)
+  assert.equal(res.body.items[0].hasSpeech, false)
 })

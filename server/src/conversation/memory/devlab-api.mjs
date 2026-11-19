@@ -407,7 +407,7 @@ function normalizeSegment(segment) {
   }
 }
 
-export function readAmbientRecordings(recordingsDir = resolveRecordingsDir(), limit = 3) {
+export function readAmbientRecordings(recordingsDir = resolveRecordingsDir(), limit = 10) {
   if (!recordingsDir || !existsSync(recordingsDir)) return []
   let files
   try {
@@ -420,7 +420,7 @@ export function readAmbientRecordings(recordingsDir = resolveRecordingsDir(), li
         return { path, name: entry.name, modifiedAt }
       })
       .sort((left, right) => right.modifiedAt - left.modifiedAt)
-      .slice(0, boundedInteger(limit, 3, 20))
+      .slice(0, boundedInteger(limit, 3, 50))
   } catch {
     return []
   }
@@ -432,6 +432,9 @@ export function readAmbientRecordings(recordingsDir = resolveRecordingsDir(), li
         .map(normalizeSegment)
         .filter(Boolean)
         .slice(0, 300)
+      const speechSegmentCount = Number.isFinite(Number(parsed.speechSegmentCount))
+        ? Number(parsed.speechSegmentCount)
+        : segments.length
       recordings.push({
         file: clean(file.name, 200),
         batchId: clean(parsed.batchId ?? parsed.batch_id, 200),
@@ -443,6 +446,8 @@ export function readAmbientRecordings(recordingsDir = resolveRecordingsDir(), li
           ? Number(parsed.durationSeconds)
           : 0,
         segmentCount: segments.length,
+        speechSegmentCount,
+        hasSpeech: speechSegmentCount > 0,
         segments,
       })
     } catch {
@@ -450,6 +455,224 @@ export function readAmbientRecordings(recordingsDir = resolveRecordingsDir(), li
     }
   }
   return recordings
+}
+
+function formatMinutesSeconds(totalSeconds) {
+  const s = Math.max(0, Math.floor(totalSeconds || 0))
+  const mins = Math.floor(s / 60)
+  const secs = s % 60
+  if (mins === 0) return `${secs}秒`
+  return `${mins}分${secs < 10 ? '0' : ''}${secs}秒`
+}
+
+export function readAmbientStatus(recordingsDir = resolveRecordingsDir()) {
+  const fallback = {
+    recordingActive: false,
+    recordingId: '',
+    sessionStartedAt: '',
+    sessionDurationSeconds: 0,
+    tracks: {},
+    queue: {
+      pendingCount: 0,
+      completedCount: 0,
+      failedCount: 0,
+      currentTranscribing: null,
+      batches: [],
+    },
+    latestTranscript: null,
+    summary: {
+      recordingText: '未开启录音',
+      asrText: '队列空闲',
+    },
+    recordingsDir: recordingsDir || '',
+  }
+  if (!recordingsDir || !existsSync(recordingsDir)) return fallback
+
+  const now = Date.now()
+  let entries = []
+  try {
+    entries = readdirSync(recordingsDir, { withFileTypes: true })
+  } catch {
+    return fallback
+  }
+
+  // 1. Live partial audio files (indicates active streaming from microphone/system)
+  const partials = entries
+    .filter(e => e.isFile() && e.name.endsWith('.partial.wav'))
+    .map(e => {
+      const filePath = join(recordingsDir, e.name)
+      let size = 0
+      let mtime = 0
+      try {
+        const st = statSync(filePath)
+        size = st.size
+        mtime = st.mtimeMs
+      } catch {}
+      return { name: e.name, size, mtime }
+    })
+  const activePartials = partials.filter(p => now - p.mtime < 120_000)
+  const recordingActive = activePartials.length > 0
+
+  // 2. Latest session manifest
+  const manifests = entries
+    .filter(e => e.isFile() && e.name.endsWith('.json') && !e.name.endsWith('.asr.json') && !e.name.endsWith('.microphone.json'))
+    .map(e => {
+      const filePath = join(recordingsDir, e.name)
+      let mtime = 0
+      try { mtime = statSync(filePath).mtimeMs } catch {}
+      return { path: filePath, name: e.name, mtime }
+    })
+    .sort((a, b) => b.mtime - a.mtime)
+
+  let manifest = null
+  if (manifests.length > 0) {
+    try {
+      manifest = JSON.parse(readFileSync(manifests[0].path, 'utf8'))
+    } catch {}
+  }
+
+  // 3. Sidecar log inspection for real-time inference stage
+  let asrStage = ''
+  const logPath = join(dirname(recordingsDir), 'ambient-audio-recording-sidecar.log')
+  if (existsSync(logPath)) {
+    try {
+      const logContent = readFileSync(logPath, 'utf8')
+      const lines = logContent.trim().split('\n').slice(-30).reverse()
+      for (const line of lines) {
+        if (line.includes('process_audio asr_batch')) {
+          const m = line.match(/batch=(\d+).*returned=(\d+)/)
+          asrStage = m ? `离线 ASR 模型运算中 (分块 #${m[1]})` : '离线 ASR 模型运算中'
+          break
+        } else if (line.includes('Voice VAD completed')) {
+          const m = line.match(/speech_segments=(\d+)/)
+          asrStage = m ? `VAD 检出 ${m[1]} 段语音，准备解码` : 'VAD 语音活动检测完成'
+          break
+        } else if (line.includes('process_audio start')) {
+          asrStage = '音频特征加载与 VAD 分析中'
+          break
+        } else if (line.includes('ambient audio batch transcribed')) {
+          asrStage = '最近切片转录完成'
+          break
+        }
+      }
+    } catch {}
+  }
+
+  const transcripts = Array.isArray(manifest?.transcripts) ? manifest.transcripts : []
+  let pendingCount = 0
+  let completedCount = 0
+  let failedCount = 0
+  let currentTranscribing = null
+
+  const batches = transcripts.map(t => {
+    let status = t.asrStatus || 'pending'
+    if (status === 'completed') {
+      completedCount++
+    } else if (status === 'failed') {
+      failedCount++
+    } else {
+      pendingCount++
+      if (!currentTranscribing) {
+        status = 'transcribing'
+        currentTranscribing = {
+          audioFile: clean(t.audioFile, 200),
+          transcriptFile: clean(t.transcriptFile, 200),
+          source: clean(t.source, 80),
+          batchIndex: t.batchIndex,
+          stage: asrStage || '离线 ASR 模型推理中',
+        }
+      }
+    }
+    const segmentCount = Number.isFinite(Number(t.transcriptSegmentCount)) ? Number(t.transcriptSegmentCount) : null
+    return {
+      audioFile: clean(t.audioFile, 200),
+      transcriptFile: clean(t.transcriptFile, 200),
+      source: clean(t.source, 80),
+      batchIndex: t.batchIndex,
+      status,
+      speechSegmentCount: segmentCount,
+      hasSpeech: typeof segmentCount === 'number' ? segmentCount > 0 : null,
+    }
+  })
+
+  // 4. Latest completed transcript file
+  const asrFiles = entries
+    .filter(e => e.isFile() && e.name.endsWith('.asr.json'))
+    .map(e => {
+      const filePath = join(recordingsDir, e.name)
+      let mtime = 0
+      try { mtime = statSync(filePath).mtimeMs } catch {}
+      return { path: filePath, name: e.name, mtime }
+    })
+    .sort((a, b) => b.mtime - a.mtime)
+
+  let latestTranscript = null
+  if (asrFiles.length > 0) {
+    try {
+      const parsed = JSON.parse(readFileSync(asrFiles[0].path, 'utf8'))
+      const speechCount = Number.isFinite(Number(parsed.speechSegmentCount))
+        ? Number(parsed.speechSegmentCount)
+        : (Array.isArray(parsed.segments) ? parsed.segments.length : 0)
+      latestTranscript = {
+        file: clean(asrFiles[0].name, 200),
+        source: clean(parsed.source, 80),
+        startedAt: normalizeTimestamp(parsed.startedAt ?? parsed.started_at),
+        endedAt: normalizeTimestamp(parsed.endedAt ?? parsed.ended_at),
+        durationSeconds: Number(parsed.durationSeconds) || 0,
+        speechSegmentCount: speechCount,
+        hasSpeech: speechCount > 0,
+        completedAt: new Date(asrFiles[0].mtime).toISOString(),
+      }
+    } catch {}
+  }
+
+  // 5. Session timing
+  const sessionStartedAt = manifest?.started_at ? normalizeTimestamp(manifest.started_at) : ''
+  let sessionDurationSeconds = 0
+  if (sessionStartedAt) {
+    const startedMs = new Date(sessionStartedAt).getTime()
+    if (!Number.isNaN(startedMs) && startedMs > 0) {
+      sessionDurationSeconds = Math.max(0, Math.round((now - startedMs) / 1000))
+    }
+  }
+
+  // 6. Summary strings
+  const recordingText = recordingActive
+    ? `正在持续录音中（已采集 ${formatMinutesSeconds(sessionDurationSeconds)}）`
+    : (sessionStartedAt ? `当前空闲（上次录制于 ${sessionStartedAt.slice(11, 19)}）` : '当前未开启录音')
+
+  let asrText = '队列空闲'
+  if (currentTranscribing) {
+    const src = currentTranscribing.source === 'system' ? '系统音频' : '麦克风'
+    asrText = `正在转录: ${src} #${currentTranscribing.batchIndex} (${currentTranscribing.stage})`
+  } else if (pendingCount > 0) {
+    asrText = `${pendingCount} 个批次排队等待转录`
+  } else if (latestTranscript) {
+    asrText = latestTranscript.hasSpeech
+      ? `最近转录完成: 检出 ${latestTranscript.speechSegmentCount} 段对话发言`
+      : '最近转录完成: 未检测到有效人声（环境静音或背景杂音）'
+  }
+
+  return {
+    recordingActive,
+    recordingId: clean(manifest?.recording_id, 100),
+    sessionStartedAt,
+    sessionDurationSeconds,
+    tracks: manifest?.tracks || {},
+    queue: {
+      pendingCount,
+      completedCount,
+      failedCount,
+      currentTranscribing,
+      batches: batches.slice(0, 15),
+    },
+    latestTranscript,
+    summary: {
+      recordingText,
+      asrText,
+    },
+    recordingsDir,
+  }
 }
 
 // The Python module is executed inline via `-c` (no shell): the payload is a
@@ -1051,8 +1274,9 @@ export function registerDevLabRoutes(app, options = {}) {
   app.get('/api/devlab/ambient-recordings', (req, res) => {
     res.setHeader('cache-control', 'no-store')
     try {
-      const items = readAmbientRecordings(recordingsDir, boundedInteger(req?.query?.limit, 3, 20))
-      return res.json({ items, total: items.length })
+      const items = readAmbientRecordings(recordingsDir, boundedInteger(req?.query?.limit, 10, 50))
+      const status = readAmbientStatus(recordingsDir)
+      return res.json({ success: true, status, items, total: items.length })
     } catch {
       return res.status(503).json({ code: 'devlab_ambient_unavailable', items: [] })
     }

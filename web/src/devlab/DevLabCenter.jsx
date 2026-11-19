@@ -50,7 +50,7 @@ const SCENARIOS = [
   },
 ]
 
-const AMBIENT_POLL_MS = 10_000
+const AMBIENT_POLL_MS = 5_000
 
 async function readJson(path, options = {}, signal) {
   const cleanPath = String(path).replace(/^\//, '')
@@ -411,18 +411,20 @@ function SparksTab({ items, loading, error, busy, evaluation, onRefresh, onSimul
   </section>
 }
 
-function AmbientTab({ recordings, loading, error, onRefresh }) {
-  const segments = recordings.flatMap(recording => (recording.segments || []).map(segment => ({
+function AmbientTab({ recordings, status, loading, error, onRefresh }) {
+  const hasRecordings = recordings.length > 0
+  const speechSegments = recordings.flatMap(recording => (recording.segments || []).map(segment => ({
     ...segment,
     file: recording.file,
     source: recording.source,
   })))
+
   return <section className="tab-panel">
     <div className="panel-toolbar">
       <div>
         <h2>{t('环境音轨探针')}</h2>
         <p className="panel-sub">
-          {t('最近 {n} 个转录批次 · 每 10 秒自动刷新', { n: recordings.length })}
+          {t('实时音频捕获与离线 ASR 转录流水线监控 · 每 5 秒自动同步')}
         </p>
       </div>
       <div className="toolbar-actions">
@@ -432,29 +434,162 @@ function AmbientTab({ recordings, loading, error, onRefresh }) {
       </div>
     </div>
     {error && <div className="devlab-alert" role="alert">⚠ {error}</div>}
+
+    {/* Live Status Cards Grid */}
+    <div className="ambient-status-grid">
+      <div className="ambient-status-card">
+        <div className="ambient-status-header">
+          <span className="ambient-card-title">🎙️ {t('录音流采集状态')}</span>
+          <span className={`ambient-badge ${status?.recordingActive ? 'active' : 'idle'}`}>
+            <span className="ambient-pulse-dot" />
+            {status?.recordingActive ? t('持续采集录制中') : t('当前空闲')}
+          </span>
+        </div>
+        <div className="ambient-status-body">
+          <div className="ambient-status-primary">
+            {status?.summary?.recordingText || (status?.recordingActive ? t('录音正在进行') : t('未检测到活跃录音流'))}
+          </div>
+          <div className="ambient-status-meta">
+            <span>{t('麦克风')}: {status?.tracks?.microphone ? '🟢 已启用' : '⚪ 未激活'}</span>
+            <span>{t('系统音')}: {status?.tracks?.system ? '🟢 已启用' : '⚪ 未激活'}</span>
+            {status?.sessionDurationSeconds > 0 && <span>{t('已采时长')}: {Math.floor(status.sessionDurationSeconds / 60)}分{status.sessionDurationSeconds % 60}秒</span>}
+          </div>
+        </div>
+      </div>
+
+      <div className="ambient-status-card">
+        <div className="ambient-status-header">
+          <span className="ambient-card-title">⚙️ {t('离线 ASR 推理流水线')}</span>
+          <span className={`ambient-badge ${status?.queue?.currentTranscribing ? 'working' : (status?.queue?.pendingCount > 0 ? 'pending' : 'idle')}`}>
+            {status?.queue?.currentTranscribing ? t('正在转录') : (status?.queue?.pendingCount > 0 ? t('排队中') : t('队列空闲'))}
+          </span>
+        </div>
+        <div className="ambient-status-body">
+          <div className="ambient-status-primary">
+            {status?.summary?.asrText || t('队列空闲')}
+          </div>
+          <div className="ambient-status-meta">
+            <span>{t('待转录')}: {status?.queue?.pendingCount ?? 0}</span>
+            <span>{t('已完成')}: {status?.queue?.completedCount ?? 0}</span>
+            {Boolean(status?.queue?.failedCount) && <span className="text-danger">{t('失败')}: {status.queue.failedCount}</span>}
+          </div>
+        </div>
+      </div>
+
+      <div className="ambient-status-card">
+        <div className="ambient-status-header">
+          <span className="ambient-card-title">🔍 {t('最新切片转录判定')}</span>
+          <span className={`ambient-badge ${status?.latestTranscript ? (status.latestTranscript.hasSpeech ? 'active' : 'silence') : 'idle'}`}>
+            {status?.latestTranscript
+              ? (status.latestTranscript.hasSpeech ? t('检出有效人声') : t('纯静音/背景音'))
+              : t('等待切片')}
+          </span>
+        </div>
+        <div className="ambient-status-body">
+          <div className="ambient-status-primary">
+            {status?.latestTranscript
+              ? (status.latestTranscript.hasSpeech
+                  ? t('检出 {n} 段发言 ({source})', {
+                      n: status.latestTranscript.speechSegmentCount,
+                      source: status.latestTranscript.source === 'system' ? t('系统音频') : t('麦克风')
+                    })
+                  : t('音频切片已处理，未检出有效人声对话'))
+              : t('音频通常按 10 分钟分段封包离线解码')}
+          </div>
+          <div className="ambient-status-meta">
+            {status?.latestTranscript?.completedAt && <span>{t('完成时间')}: {formatTime(status.latestTranscript.completedAt)}</span>}
+            {status?.latestTranscript?.durationSeconds > 0 && <span>{t('切片时长')}: {Math.round(status.latestTranscript.durationSeconds)}秒</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    {/* Batch Pipeline Queue Visualizer */}
+    {Array.isArray(status?.queue?.batches) && status.queue.batches.length > 0 && (
+      <div className="ambient-pipeline-card">
+        <div className="ambient-pipeline-header">
+          <span className="ambient-pipeline-title">{t('切片转录队列详情 (最近 {n} 批次)', { n: status.queue.batches.length })}</span>
+          <small className="ambient-pipeline-hint">{t('10分钟音频分段切片 · 依次经由 VAD 语音检测与离线 ASR 模型提取发言')}</small>
+        </div>
+        <div className="ambient-pipeline-chips">
+          {status.queue.batches.map((batch, idx) => {
+            const isCurrent = batch.status === 'transcribing'
+            const isDone = batch.status === 'completed'
+            const isFailed = batch.status === 'failed'
+            const srcLabel = batch.source === 'system' ? t('系统音') : t('麦克风')
+            return (
+              <div key={`${batch.audioFile || idx}`} className={`ambient-pipeline-chip ${batch.status} ${batch.hasSpeech ? 'has-speech' : ''}`}>
+                <span className="chip-badge">
+                  {isCurrent ? '⚡' : (isDone ? (batch.hasSpeech ? '🗣️' : '🤫') : (isFailed ? '❌' : '⏳'))}
+                </span>
+                <span className="chip-label">{srcLabel} #{batch.batchIndex ?? (idx + 1)}</span>
+                <span className="chip-status">
+                  {isCurrent
+                    ? t('解码推理中…')
+                    : (isDone
+                        ? (batch.hasSpeech ? t('{n}条人声', { n: batch.speechSegmentCount }) : t('0条人声(静音)'))
+                        : (isFailed ? t('失败') : t('排队等待')))}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    )}
+
     <div className="speaker-legend">
       <span className="legend-chip owner">{t('佩戴者 · speaker_0')}</span>
       <span className="legend-chip external">{t('外部发言人 · speaker_1 / others')}</span>
     </div>
-    {!loading && !error && segments.length === 0 && <EmptyState
-      icon="🎙️"
-      title={t('尚未捕获环境转录')}
-      hint={t('开启环境音轨录制后，最近 3 个批次的对白片段会显示在这里。')}
-    />}
+
+    {!loading && !error && !hasRecordings && (
+      <EmptyState
+        icon="🎙️"
+        title={t('尚未产生离线转录切片')}
+        hint={t('录音正在后台持续进行。每 10 分钟切片封包后，会在这里自动呈现转录对白与静音判定。')}
+      />
+    )}
+
     <div className="transcript-stream">
-      {segments.map((segment, index) => {
-        const owner = isOwner(segment.speaker)
-        return <div className={`transcript-row ${owner ? 'owner' : 'external'}`} key={`${segment.file}:${index}`}>
-          <span className="speaker-tag">{owner ? t('佩戴者') : t('外部')}</span>
-          <div className="transcript-content">
-            <p>{segment.text}</p>
-            <small>
-              {formatTime(segment.timestamp)}
-              {formatDuration(segment.duration) ? ` · ${formatDuration(segment.duration)}` : ''}
-              {segment.source ? ` · ${segment.source}` : ''}
-            </small>
-          </div>
-        </div>
+      {recordings.map((recording, rIdx) => {
+        if (!recording.hasSpeech || !recording.segments?.length) {
+          return (
+            <div className="transcript-silence-notice" key={`${recording.file || rIdx}`}>
+              <span className="silence-icon">🤫</span>
+              <div className="silence-content">
+                <div className="silence-title">
+                  {t('已转录切片：{source}（时长 {duration}秒）· 未检出人声对话', {
+                    source: recording.source === 'system' ? t('系统音频') : t('麦克风'),
+                    duration: Math.round(recording.durationSeconds) || 600,
+                  })}
+                </div>
+                <div className="silence-desc">
+                  {t('VAD（语音活动检测）判定该切片无有效人类说话声，背景静音或白噪音已自动过滤')}
+                </div>
+              </div>
+              <small className="silence-meta">
+                {formatTime(recording.endedAt || recording.startedAt)}
+              </small>
+            </div>
+          )
+        }
+
+        return recording.segments.map((segment, sIdx) => {
+          const owner = isOwner(segment.speaker)
+          return (
+            <div className={`transcript-row ${owner ? 'owner' : 'external'}`} key={`${recording.file}:${sIdx}`}>
+              <span className="speaker-tag">{owner ? t('佩戴者') : t('外部')}</span>
+              <div className="transcript-content">
+                <p>{segment.text}</p>
+                <small>
+                  {formatTime(segment.timestamp)}
+                  {formatDuration(segment.duration) ? ` · ${formatDuration(segment.duration)}` : ''}
+                  {recording.source ? ` · ${recording.source === 'system' ? t('系统音') : t('麦克风')}` : ''}
+                </small>
+              </div>
+            </div>
+          )
+        })
       })}
     </div>
   </section>
@@ -499,6 +634,7 @@ export default function DevLabCenter() {
   const [sparksLoading, setSparksLoading] = useState(false)
   const [sparksError, setSparksError] = useState('')
   const [recordings, setRecordings] = useState([])
+  const [ambientStatus, setAmbientStatus] = useState(null)
   const [ambientLoading, setAmbientLoading] = useState(false)
   const [ambientError, setAmbientError] = useState('')
   const [crystallized, setCrystallized] = useState(null)
@@ -552,6 +688,7 @@ export default function DevLabCenter() {
       const payload = await readJson('api/devlab/ambient-recordings', {}, signal)
       if (signal?.aborted) return
       setRecordings(Array.isArray(payload.items) ? payload.items : [])
+      setAmbientStatus(payload.status || null)
     } catch (error) {
       if (error?.name !== 'AbortError') setAmbientError(error?.message || t('读取环境音轨失败'))
     } finally {
@@ -737,6 +874,7 @@ export default function DevLabCenter() {
       />}
       {activeTab === 'ambient' && <AmbientTab
         recordings={recordings}
+        status={ambientStatus}
         loading={ambientLoading}
         error={ambientError}
         onRefresh={() => void loadAmbient()}
